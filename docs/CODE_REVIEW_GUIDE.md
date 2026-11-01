@@ -136,14 +136,17 @@
 
 | 关卡 | 工具 | 阈值 | 现状 |
 |---|---|---|---|
-| 编译告警 | `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | 0 warning，加 `-Werror` | 仅有前两个 ⚠️ |
-| 格式 | `clang-format`（已提供 `.clang-format`） | 零 diff | 缺失 ❌ |
-| 静态分析 | `clang-tidy`（已提供 `.clang-tidy`） | P0 级诊断 0 条 | 缺失 ❌ |
-| 单元测试 | `ctest` | 100% 通过 | 已有 ✅ |
-| 内存/UB | ASan + UBSan | 0 error | 已有 ✅（但插桩范围有缺陷，见报告 S11） |
-| 数据竞争 | TSan | 0 warning | 缺失 ❌ |
+| 编译告警 | `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | 0 warning，加 `-Werror` | 前四个已开，`-Wconversion` 未开 ⚠️ |
+| 格式 | `clang-format`（已提供 `.clang-format`） | 零 diff | 已接入 `scripts/ci.sh lint`，**尚未实跑** ⚠️ |
+| 静态分析 | `clang-tidy`（已提供 `.clang-tidy`） | P0 级诊断 0 条 | 同上 ⚠️ |
+| 单元测试 | `ctest` | 100% 通过 | 用例已就绪（含 5 段并发/异常回归），**尚未实跑** ⚠️ |
+| 内存/UB | ASan + UBSan | 0 error | 已全局插桩，**尚未实跑** ⚠️ |
+| 数据竞争 | TSan | 0 warning | job 已配置，**尚未实跑** ⚠️ |
 | 覆盖率 | `gcov/lcov` | 新增代码 ≥ 80% | 缺失 ❌ |
 | 模糊测试 | libFuzzer（`json`/`url`/`http` 解析器） | 无 crash | 缺失 ❌ |
+
+> 这张表里「尚未实跑」比「缺失」更危险：缺失你知道没有，实跑没跑过却容易被当成已通过。
+> **在第一次 CI 绿之前，任何「门禁已达标」的说法都不成立。**
 
 CI 建议拆成 4 个 job：`build-and-test` / `sanitize-asan-ubsan` / `sanitize-tsan` / `lint`。
 

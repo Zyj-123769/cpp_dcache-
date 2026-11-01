@@ -11,6 +11,7 @@
 
 #include "common.hpp"
 #include "http.hpp"
+#include "http_client.hpp"
 #include "http_server.hpp"
 #include "node.hpp"
 
@@ -58,6 +59,7 @@ struct Options {
     std::string self            = "127.0.0.1:8001";
     std::string peers           = "127.0.0.1:8001";
     std::string group           = "scores";
+    std::string token;          // 内部共享 token；为空则退回 IP 判定
     int         capacity        = 100;
     int         ttl_ms          = 0;
     int         virtual_nodes   = 150;
@@ -75,7 +77,8 @@ void usage(const char* argv0) {
         "  --ttl-ms <n>            默认 TTL，0 表示不设过期 (默认 0)\n"
         "  --virtual-nodes <n>     每物理节点虚拟节点数 (默认 150)\n"
         "  --workers <n>            HTTP 工作线程数 (默认 4)\n"
-        "  --report-interval <s>   统计打印间隔秒 (默认 5)\n";
+        "  --report-interval <s>   统计打印间隔秒 (默认 5)\n"
+        "  --token <s>             内部共享 token（也可用环境变量 DCACHE_TOKEN）\n";
 }
 
 bool parse_args(int argc, char** argv, Options& o) {
@@ -101,6 +104,8 @@ bool parse_args(int argc, char** argv, Options& o) {
             const char* v = need("--workers"); if (!v) return false; o.workers = std::atoi(v);
         } else if (a == "--report-interval") {
             const char* v = need("--report-interval"); if (!v) return false; o.report_interval = std::atoi(v);
+        } else if (a == "--token") {
+            const char* v = need("--token"); if (!v) return false; o.token = v;
         } else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -128,6 +133,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // token 优先取环境变量：命令行参数在 `ps aux` 里对同机所有用户可见，
+    // 一个只用来证明「我是集群内部」的凭据不该出现在进程列表里。
+    if (o.token.empty()) {
+        const char* env_token = std::getenv("DCACHE_TOKEN");
+        if (env_token != nullptr) {
+            o.token = env_token;
+        }
+    }
+
     std::vector<std::string> peers = split(o.peers, ',');
     bool has_self = false;
     for (const auto& p : peers) {
@@ -141,8 +155,51 @@ int main(int argc, char** argv) {
     node.AddGroup(o.group, static_cast<std::size_t>(o.capacity), mock_getter,
                   static_cast<std::uint64_t>(o.ttl_ms), 30000);
     node.SetPeers(peers);
+    node.SetAuthToken(o.token);
+
+    if (o.token.empty()) {
+        std::cerr << "[node] 警告：未配置内部 token（--token 或 DCACHE_TOKEN），"
+                     "X-DCache-Hops 只能按来源 IP 判定——同机或同网段的任何进程都能伪造该头。\n";
+    }
 
     HttpServer server;
+
+    // 服务端指标由 HttpServer 自己统计，Node 不该反向依赖它，所以用钩子注入。
+    // 必须在 Start 之前挂上：ServeHTTP 是在工作线程里读这个钩子的。
+    node.SetMetricsHook([&server](std::string& out) {
+        const HttpServer::Metrics m = server.GetMetrics();
+
+        out += "# HELP dcache_http_requests_total 进入处理流程的请求数\n";
+        out += "# TYPE dcache_http_requests_total counter\n";
+        out += "dcache_http_requests_total " + std::to_string(m.requests_total) + "\n";
+
+        // 报文非法、声明体过大这类请求根本到不了 handler，只能在这里暴露，
+        // 否则攻击特征在监控上完全隐形。
+        out += "# HELP dcache_http_requests_dropped_total 报文非法/声明体过大而未产生响应的请求数\n";
+        out += "# TYPE dcache_http_requests_dropped_total counter\n";
+        out += "dcache_http_requests_dropped_total " + std::to_string(m.requests_dropped) + "\n";
+
+        out += "# HELP dcache_http_responses_total 按状态码类别统计的响应数\n";
+        out += "# TYPE dcache_http_responses_total counter\n";
+        out += "dcache_http_responses_total{code_class=\"2xx\"} " + std::to_string(m.responses_2xx) +
+               "\n";
+        out += "dcache_http_responses_total{code_class=\"4xx\"} " + std::to_string(m.responses_4xx) +
+               "\n";
+        out += "dcache_http_responses_total{code_class=\"5xx\"} " + std::to_string(m.responses_5xx) +
+               "\n";
+
+        out += "# HELP dcache_http_active_connections 当前挂起的连接数（含 keep-alive 空闲连接）\n";
+        out += "# TYPE dcache_http_active_connections gauge\n";
+        out += "dcache_http_active_connections " + std::to_string(m.active_conns) + "\n";
+
+        // 转发连接池的空闲连接数。持续增长只说明「取走的少、放回的多」，
+        // 持续为 0 且转发量不小则说明复用没生效——两种情况都值得告警。
+        out += "# HELP dcache_client_idle_connections 节点间转发的空闲连接数\n";
+        out += "# TYPE dcache_client_idle_connections gauge\n";
+        out += "dcache_client_idle_connections " + std::to_string(HttpClient::IdleConnections()) +
+               "\n";
+    });
+
     if (!server.Start(host, port, [&node](const HttpRequest& req, HttpResponse& resp) {
             node.ServeHTTP(req, resp);
         }, o.workers)) {
@@ -155,7 +212,8 @@ int main(int argc, char** argv) {
 
     std::cout << "[node] listening on " << o.self
               << " group=" << o.group
-              << " peers=" << o.peers << "\n";
+              << " peers=" << o.peers
+              << " auth=" << (o.token.empty() ? "off" : "token") << "\n";
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(o.report_interval));
@@ -164,6 +222,11 @@ int main(int argc, char** argv) {
     }
 
     server.Stop();
+
+    // 主动关闭池中残留的空闲连接：静态对象的析构顺序不确定，
+    // 等到析构时再去 close 可能已经晚于进程收尾，fd 就漏了。
+    HttpClient::CloseIdleConnections();
+
     std::cout << "[node] stopped\n";
     return 0;
 }

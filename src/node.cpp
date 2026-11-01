@@ -2,11 +2,54 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 #include "json.hpp"
 #include "url.hpp"
 
 namespace dcache {
+
+namespace {
+
+// Prometheus 文本格式的标签值转义。只有反斜杠、双引号、换行需要处理，
+// 但漏掉任意一个都会让整条指标被 Prometheus 判为格式错误而丢弃。
+std::string PromLabelEscape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
+void AppendHelpType(std::string& out, const char* name, const char* type, const char* help) {
+    out += "# HELP ";
+    out += name;
+    out += " ";
+    out += help;
+    out += "\n# TYPE ";
+    out += name;
+    out += " ";
+    out += type;
+    out += "\n";
+}
+
+// 指标定义表：名字 / 类型 / 说明 / 对应的 Stats 字段。
+// 用表驱动而不是逐个手写，是为了让「新增一个指标」只改一行——
+// 手写六遍 out += "dcache_group_xxx{group=..." 这种代码，漏一个也不会有任何报错。
+struct GroupMetricDef {
+    const char*                name;
+    const char*                type;
+    const char*                help;
+    std::uint64_t Group::Stats::*field;
+};
+
+} // namespace
 
 Node::Node(std::string self_addr, int virtual_nodes)
     : self_(std::move(self_addr)),
@@ -33,6 +76,14 @@ void Node::SetPeers(const std::vector<std::string>& peers) {
     pool_->SetPeers(peers);
 }
 
+void Node::SetAuthToken(const std::string& token) {
+    pool_->SetAuthToken(token);
+}
+
+bool Node::HasAuthToken() const {
+    return !pool_->AuthToken().empty();
+}
+
 GetResult Node::Get(const std::string& group, const std::string& key) {
     Group* g = FindGroup(group);
     if (g == nullptr) {
@@ -49,6 +100,14 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         resp.status = 405;
         resp.headers["Allow"] = "GET";
         resp.body   = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (req.path == "/metrics") {
+        // Prometheus 抓取端点。Content-Type 必须带 version=0.0.4，
+        // 否则部分版本的 Prometheus 会按旧格式解析并报错。
+        resp.headers["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8";
+        resp.body = BuildMetrics();
         return;
     }
 
@@ -83,18 +142,30 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         return;
     }
 
-    // 转发跳数只信任来自集群节点的请求。
+    // 转发跳数只信任来自集群内部的请求。
     //
     // 若直接采信任意请求的 X-DCache-Hops，外部客户端发一个 "2" 就能让本节点判定
     // hops >= kMaxForwardHops 而退化为本机回源：既绕过了按 key 的一致性哈希分片，
     // 又把全网流量压到数据源，还能把不属于本节点的 key 塞进本地缓存。
+    //
+    // 判据的优先级：配置了 token 就只认 token；没配才退回「来源 IP 属于 peers」。
     int hops = 0;
-    if (pool_->IsTrustedHost(req.remote_ip)) {
-        auto hit = req.headers.find("X-DCache-Hops");
-        if (hit != req.headers.end()) {
-            const int parsed = std::atoi(hit->second.c_str());
+    auto hops_it = req.headers.find("X-DCache-Hops");
+    if (hops_it != req.headers.end()) {
+        std::string token;
+        auto token_it = req.headers.find("X-DCache-Token");
+        if (token_it != req.headers.end()) {
+            token = token_it->second;
+        }
+
+        if (pool_->IsTrustedRequest(req.remote_ip, token)) {
+            const int parsed = std::atoi(hops_it->second.c_str());
             hops = parsed < 0 ? 0
                  : (parsed > Group::kMaxForwardHops ? Group::kMaxForwardHops : parsed);
+        } else {
+            // 有人带着内部语义头来但过不了校验：按 hops=0 处理（等价外部客户端），
+            // 同时记账。这类伪造尝试在访问日志里看不出任何异常，只能靠计数器暴露。
+            hops_rejected_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -152,6 +223,68 @@ std::string Node::DumpStats() const {
         out += "}";
     }
     out += "}";
+    return out;
+}
+
+std::string Node::BuildMetrics() const {
+    std::vector<std::pair<std::string, Group::Stats>> snapshots;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        snapshots.reserve(groups_.size());
+        for (const auto& kv : groups_) {
+            snapshots.emplace_back(kv.first, kv.second->stats());
+        }
+    }
+
+    static const GroupMetricDef kGroupMetrics[] = {
+        {"dcache_group_local_hit_total", "counter", "本地 LRU 命中次数", &Group::Stats::local_hit},
+        {"dcache_group_local_miss_total", "counter", "本地 LRU 未命中次数", &Group::Stats::local_miss},
+        {"dcache_group_source_fetch_total", "counter", "本机回源次数", &Group::Stats::source_fetch},
+        {"dcache_group_remote_fetch_total", "counter", "转发到对端的次数", &Group::Stats::remote_fetch},
+        {"dcache_group_error_total", "counter", "回源或转发失败次数（结果不入缓存）",
+         &Group::Stats::error_count},
+        {"dcache_group_cache_size", "gauge", "当前本地缓存条目数", &Group::Stats::cache_size},
+    };
+
+    std::string out;
+
+    for (const auto& def : kGroupMetrics) {
+        AppendHelpType(out, def.name, def.type, def.help);
+        for (const auto& kv : snapshots) {
+            out += def.name;
+            out += "{group=\"";
+            out += PromLabelEscape(kv.first);
+            out += "\"} ";
+            out += std::to_string(kv.second.*(def.field));
+            out += "\n";
+        }
+    }
+
+    // 命中率单独算：它是派生量，不适合塞进上面的表（表里的字段都是直接可读的计数）。
+    AppendHelpType(out, "dcache_group_hit_rate", "gauge",
+                   "本地命中率 = local_hit / (local_hit + local_miss)");
+    for (const auto& kv : snapshots) {
+        const std::uint64_t hit   = kv.second.local_hit;
+        const std::uint64_t denom = hit + kv.second.local_miss;
+        const double rate = denom == 0 ? 0.0 : static_cast<double>(hit) / static_cast<double>(denom);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.6f", rate);
+        out += "dcache_group_hit_rate{group=\"";
+        out += PromLabelEscape(kv.first);
+        out += "\"} ";
+        out += buf;
+        out += "\n";
+    }
+
+    AppendHelpType(out, "dcache_hops_rejected_total", "counter",
+                   "携带 X-DCache-Hops 但未通过可信校验的请求数（伪造内部头的信号）");
+    out += "dcache_hops_rejected_total ";
+    out += std::to_string(hops_rejected_.load(std::memory_order_relaxed));
+    out += "\n";
+
+    if (metrics_hook_) {
+        metrics_hook_(out);
+    }
     return out;
 }
 

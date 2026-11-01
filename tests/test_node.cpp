@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "auth.hpp"
 #include "check.hpp"
 #include "consistent_hash.hpp"
 #include "group.hpp"
@@ -103,6 +105,79 @@ bool raw_exchange(std::uint16_t port, const std::string& request,
 }
 
 } // namespace
+
+// 可重复使用的原始连接：验证服务端 keep-alive 必须靠它。
+// HttpClient 是同步「一问一答」，永远看不到「同一连接上的第二条请求」。
+class RawConn {
+public:
+    ~RawConn() { Close(); }
+
+    bool Open(std::uint16_t port) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            return false;
+        }
+        struct sockaddr_in sin;
+        std::memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port   = htons(port);
+        if (::inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr) != 1 ||
+            ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) != 0) {
+            Close();
+            return false;
+        }
+        return true;
+    }
+
+    bool Send(const std::string& s) {
+        std::size_t off = 0;
+        while (off < s.size()) {
+            const ssize_t n = ::send(fd_, s.data() + off, s.size() - off, 0);
+            if (n <= 0) {
+                return false;
+            }
+            off += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+
+    // 读出一条完整响应（按 Content-Length 定界），多余字节留在缓冲里给下一条用。
+    bool ReadResponse(std::string& out) {
+        for (;;) {
+            const std::size_t hpos = buf_.find("\r\n\r\n");
+            if (hpos != std::string::npos) {
+                const std::size_t clp = buf_.find("Content-Length: ");
+                if (clp != std::string::npos && clp < hpos) {
+                    const std::size_t want = static_cast<std::size_t>(
+                        std::strtoul(buf_.c_str() + clp + 16, nullptr, 10));
+                    const std::size_t total = hpos + 4 + want;
+                    if (buf_.size() >= total) {
+                        out = buf_.substr(0, total);
+                        buf_.erase(0, total);
+                        return true;
+                    }
+                }
+            }
+            char tmp[4096];
+            const ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
+            if (n <= 0) {
+                return false;
+            }
+            buf_.append(tmp, static_cast<std::size_t>(n));
+        }
+    }
+
+    void Close() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+private:
+    int         fd_ = -1;
+    std::string buf_;
+};
 
 int main() {
     // A. 单机 Group（无 picker）：本地命中 + 回源一次 + 空值缓存防穿透。
@@ -333,6 +408,146 @@ int main() {
                             resp, true));
         CHECK(resp.empty()); // 没有任何响应体 = 服务端直接断开
         s.Stop();
+    }
+
+    // K. keep-alive 回归：同一连接上的第二条请求必须仍被服务。
+    //    服务端处理完把 fd 交还事件循环重新挂回 epoll；旧实现一律 Connection: close，
+    //    这里第二条请求会直接读到 EOF。
+    {
+        std::atomic<int> served{0};
+        HttpServer       s;
+        CHECK(s.Start("127.0.0.1", 0,
+                      [&served](const HttpRequest&, HttpResponse& resp) {
+                          resp.status = 200;
+                          resp.body   = "ok";
+                          served.fetch_add(1);
+                      },
+                      2));
+
+        RawConn c;
+        CHECK(c.Open(s.Port()));
+
+        CHECK(c.Send("GET /a HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n"));
+        std::string r1;
+        CHECK(c.ReadResponse(r1));
+        CHECK(r1.find("200") != std::string::npos);
+        CHECK(r1.find("Connection: keep-alive") != std::string::npos);
+
+        CHECK(c.Send("GET /b HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n"));
+        std::string r2;
+        CHECK(c.ReadResponse(r2));
+        CHECK(r2.find("200") != std::string::npos);
+        CHECK(served.load() == 2);
+
+        s.Stop();
+    }
+
+    // L. 内部 token：伪造 X-DCache-Hops 但 token 不对，必须按 hops=0 处理并记账。
+    //    这里刻意让 remote_ip 是 127.0.0.1——旧的 IP 判定会直接放行，
+    //    只有 token 校验才能挡住同机的伪造者。
+    {
+        Node node("127.0.0.1:1", 150);
+        node.AddGroup("g", 10, counting_getter);
+        node.SetAuthToken("s3cret");
+
+        auto request = [&](const char* token) {
+            HttpRequest req;
+            req.method                   = "GET";
+            req.path                     = "/api/g/k";
+            req.remote_ip                = "127.0.0.1";
+            req.headers["X-DCache-Hops"] = "2";
+            if (token != nullptr) {
+                req.headers["X-DCache-Token"] = token;
+            }
+            HttpResponse resp;
+            node.ServeHTTP(req, resp);
+            return resp;
+        };
+
+        auto rejected = [&]() -> long {
+            HttpRequest m;
+            m.method = "GET";
+            m.path   = "/metrics";
+            HttpResponse      mr;
+            node.ServeHTTP(m, mr);
+            const std::string needle = "dcache_hops_rejected_total ";
+            const std::size_t p      = mr.body.find(needle);
+            if (p == std::string::npos) {
+                return -1;
+            }
+            return std::strtol(mr.body.c_str() + p + needle.size(), nullptr, 10);
+        };
+
+        CHECK(rejected() == 0);
+        CHECK(request("wrong").status == 200); // 请求本身仍正常受理，只是不信那个头
+        CHECK(rejected() == 1);
+
+        request(nullptr); // 连 token 都不带
+        CHECK(rejected() == 2);
+
+        request("s3cret"); // 正确 token
+        CHECK(rejected() == 2);
+    }
+
+    // M. /metrics 输出必须符合 Prometheus 文本格式的关键约定。
+    {
+        Node node("127.0.0.1:1", 150);
+        node.AddGroup("scores", 10, counting_getter);
+        node.Get("scores", "k1"); // 未命中 + 回源
+        node.Get("scores", "k1"); // 命中
+
+        HttpRequest m;
+        m.method = "GET";
+        m.path   = "/metrics";
+        HttpResponse resp;
+        node.ServeHTTP(m, resp);
+
+        CHECK(resp.status == 200);
+        auto ct = resp.headers.find("Content-Type");
+        CHECK(ct != resp.headers.end() && ct->second.find("text/plain") != std::string::npos);
+        CHECK(resp.body.find("# TYPE dcache_group_local_hit_total counter") != std::string::npos);
+        CHECK(resp.body.find("dcache_group_local_hit_total{group=\"scores\"} 1") !=
+              std::string::npos);
+        CHECK(resp.body.find("dcache_group_source_fetch_total{group=\"scores\"} 1") !=
+              std::string::npos);
+        CHECK(resp.body.find("dcache_group_cache_size{group=\"scores\"} 1") != std::string::npos);
+        CHECK(resp.body.find("dcache_hops_rejected_total 0") != std::string::npos);
+    }
+
+    // N. token 比较的行为正确性（常量时间是对实现的要求，这里只验语义）。
+    {
+        CHECK(ConstantTimeEquals("abc", "abc"));
+        CHECK(!ConstantTimeEquals("abc", "abd"));
+        CHECK(!ConstantTimeEquals("abc", "ab"));
+        CHECK(!ConstantTimeEquals("", "x"));
+        CHECK(ConstantTimeEquals("", ""));
+    }
+
+    // O. 客户端连接复用：连续两次转发后池中应留有空闲连接；关掉开关后不再入池。
+    {
+        HttpServer s;
+        CHECK(s.Start("127.0.0.1", 0,
+                      [](const HttpRequest&, HttpResponse& resp) {
+                          resp.status = 200;
+                          resp.body   = "ok";
+                      },
+                      2));
+
+        HttpClient::CloseIdleConnections();
+        std::string body;
+        CHECK(HttpClient::Get("127.0.0.1", s.Port(), "/a", body, 2000));
+        CHECK(HttpClient::Get("127.0.0.1", s.Port(), "/b", body, 2000));
+        CHECK(HttpClient::IdleConnections() >= 1);
+
+        HttpClient::SetKeepAlive(false);
+        HttpClient::CloseIdleConnections();
+        CHECK(HttpClient::Get("127.0.0.1", s.Port(), "/c", body, 2000));
+        CHECK(HttpClient::IdleConnections() == 0);
+        HttpClient::SetKeepAlive(true);
+
+        s.Stop();
+        // 服务端已停：池中指向它的连接必须清掉，否则后续用例会取到死连接。
+        HttpClient::CloseIdleConnections();
     }
 
     return 0;

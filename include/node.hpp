@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +37,11 @@ public:
     // 设置集群中全部节点地址（含自身）。
     void SetPeers(const std::vector<std::string>& peers);
 
+    // 内部共享 token。配置后，仅当请求携带相同 token 才采信 X-DCache-Hops；
+    // 留空则退回「来源 IP 属于 peers」的判定（只能在单机/可信内网使用）。
+    void SetAuthToken(const std::string& token);
+    bool HasAuthToken() const;
+
     // 读取 group/key（线程安全）。
     GetResult Get(const std::string& group, const std::string& key);
 
@@ -44,6 +52,14 @@ public:
     // 汇总各 Group 的统计为 JSON 字符串。
     std::string DumpStats() const;
 
+    // Prometheus 文本格式（GET /metrics）。
+    std::string BuildMetrics() const;
+
+    // 追加额外指标（服务端连接数、客户端连接池等）。Node 不应该知道 HttpServer 的存在，
+    // 所以用钩子注入而不是直接依赖。**必须在 Start 之前设置**，运行期不再改写。
+    using MetricsHook = std::function<void(std::string&)>;
+    void SetMetricsHook(MetricsHook hook) { metrics_hook_ = std::move(hook); }
+
     const std::string& Self() const { return self_; }
 
 private:
@@ -51,6 +67,13 @@ private:
     std::shared_ptr<HttpPeerPool> pool_;
     std::unordered_map<std::string, std::shared_ptr<Group>> groups_;
     mutable std::mutex mtx_; // 保护 groups_
+
+    // 携带 X-DCache-Hops 但未通过可信校验的请求数。
+    // 这个计数是「有人在伪造内部头」的唯一信号，必须对外可见（/metrics），
+    // 否则这类攻击在日志里完全隐形。
+    std::atomic<std::uint64_t> hops_rejected_{0};
+
+    MetricsHook metrics_hook_;
 };
 
 } // namespace dcache

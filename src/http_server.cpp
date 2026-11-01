@@ -3,14 +3,17 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <vector>
 
 namespace dcache {
@@ -32,7 +35,9 @@ constexpr int kSweepIntervalMs = 1000;
 constexpr int kSendTimeoutMs = 2000;
 
 // 解析请求；返回 1=完整，0=还需更多数据，-1=报文非法，-2=声明体过大。
-int parse_request(const std::string& data, HttpRequest& req) {
+// consumed（rc==1 时有效）：这条请求占用的字节数，用来判断缓冲区里是否还有第二条请求。
+int parse_request(const std::string& data, HttpRequest& req, std::size_t& consumed) {
+    consumed = 0;
     const std::size_t hpos = data.find("\r\n\r\n");
     if (hpos == std::string::npos) {
         return data.size() > kMaxRequestSize ? -1 : 0;
@@ -92,10 +97,37 @@ int parse_request(const std::string& data, HttpRequest& req) {
         return 0; // body 未收完
     }
     req.body = data.substr(hpos + 4, static_cast<std::size_t>(content_length));
+    consumed = total;
     return 1;
 }
 
-std::string build_response(const HttpResponse& resp) {
+// 取头部值并做大小写不敏感比较（HTTP 头名与 Connection 的值都可能有大小写差异）。
+bool header_equals_ci(const HttpRequest& req, const char* name, const char* value) {
+    auto it = req.headers.find(name);
+    if (it == req.headers.end()) {
+        return false;
+    }
+    const std::string& actual = it->second;
+    const std::size_t  n      = std::strlen(value);
+    if (actual.size() != n) {
+        return false;
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned char a = static_cast<unsigned char>(actual[i]);
+        const unsigned char b = static_cast<unsigned char>(value[i]);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 客户端是否显式要求复用连接。
+bool wants_keep_alive(const HttpRequest& req) {
+    return header_equals_ci(req, "Connection", "keep-alive");
+}
+
+std::string build_response(const HttpResponse& resp, bool keep_alive) {
     std::string s = "HTTP/1.1 " + std::to_string(resp.status) + " " +
                     HttpStatusText(resp.status) + "\r\n";
 
@@ -106,7 +138,7 @@ std::string build_response(const HttpResponse& resp) {
     }
     s += "Content-Type: " + content_type + "\r\n";
     s += "Content-Length: " + std::to_string(resp.body.size()) + "\r\n";
-    s += "Connection: close\r\n";
+    s += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
 
     for (const auto& h : resp.headers) {
         if (h.first == "Content-Type" || h.first == "Content-Length" ||
@@ -226,6 +258,30 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
     handler_ = std::move(handler);
     stop_ = false;
 
+    // 唤醒用的 eventfd：keep-alive 连接被交还时用它立刻叫醒 epoll。
+    wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (wake_fd_ >= 0) {
+        struct epoll_event wev;
+        std::memset(&wev, 0, sizeof(wev));
+        wev.events = EPOLLIN;
+        wev.data.fd = wake_fd_;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &wev) != 0) {
+            ::close(wake_fd_);
+            wake_fd_ = -1;
+        }
+    }
+    // 拿不到 eventfd 不视为启动失败：退回「靠 epoll_wait 超时兜底」的模式，
+    // 功能仍然正确，只是复用连接可能要多等一个超时周期。
+
+    // 复位指标：同一个对象 Stop 后再 Start，计数应该从零开始，
+    // 否则「重启后的服务」会带着上一轮的命中率，读数没有意义。
+    requests_total_.store(0, std::memory_order_relaxed);
+    requests_dropped_.store(0, std::memory_order_relaxed);
+    responses_2xx_.store(0, std::memory_order_relaxed);
+    responses_4xx_.store(0, std::memory_order_relaxed);
+    responses_5xx_.store(0, std::memory_order_relaxed);
+    active_conns_.store(0, std::memory_order_relaxed);
+
     // 预留一个 fd，供 EMFILE 时自救（见 run()）。取不到不影响启动，只是少一层保护。
     reserve_fd_ = ::open("/dev/null", O_RDONLY);
 
@@ -247,6 +303,17 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
         workers_.emplace_back(&HttpServer::worker_loop, this);
     }
     return true;
+}
+
+HttpServer::Metrics HttpServer::GetMetrics() const {
+    Metrics m;
+    m.requests_total   = requests_total_.load(std::memory_order_relaxed);
+    m.requests_dropped = requests_dropped_.load(std::memory_order_relaxed);
+    m.responses_2xx    = responses_2xx_.load(std::memory_order_relaxed);
+    m.responses_4xx    = responses_4xx_.load(std::memory_order_relaxed);
+    m.responses_5xx    = responses_5xx_.load(std::memory_order_relaxed);
+    m.active_conns     = active_conns_.load(std::memory_order_relaxed);
+    return m;
 }
 
 void HttpServer::Stop() {
@@ -273,13 +340,28 @@ void HttpServer::Stop() {
     workers_.clear();
 
     // ③ 兜底回收：正常路径下队列已被排空，异常路径下也避免残留任务泄漏 fd。
-    std::deque<Task> leftover;
+    std::deque<Task>     leftover;
+    std::deque<Recycled> leftover_conns;
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
         leftover.swap(queue_);
+        // keep-alive 连接同理：Stop 之后事件循环已经退出，没有人再 drain 它们。
+        // 工作线程若恰好在 Stop 之后才交还，这些 fd 只能在这里关闭。
+        leftover_conns.swap(recycled_);
     }
     for (auto& t : leftover) {
         ::close(t.fd);
+    }
+    for (auto& r : leftover_conns) {
+        ::close(r.fd);
+    }
+
+    // wake_fd_ 必须等到工作线程全部退出后才关闭：recycle_conn 在工作线程里写它，
+    // 若在 cleanup() 里提前 close，worker 可能写出一个「已经被系统回收、又被别人占用」
+    // 的 fd 号——那不是 fp 泄漏级别的问题，是往别人的连接里写脏数据。
+    if (wake_fd_ >= 0) {
+        ::close(wake_fd_);
+        wake_fd_ = -1;
     }
 }
 
@@ -298,6 +380,15 @@ void HttpServer::run() {
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             std::uint32_t ev = events[i].events;
+
+            if (fd == wake_fd_) {
+                // 把计数读空，否则水平触发模式下会反复唤醒（又变成空转）。
+                std::uint64_t drained = 0;
+                while (::read(wake_fd_, &drained, sizeof(drained)) > 0) {
+                }
+                drain_recycled();
+                continue;
+            }
 
             if (fd == listen_fd_) {
                 for (;;) {
@@ -368,6 +459,13 @@ void HttpServer::run() {
             }
         }
 
+        // 兜底：即使 eventfd 不可用、或唤醒事件排在下一批，也不会让交还的连接一直卡着。
+        drain_recycled();
+
+        // 活跃连接数由事件循环线程独占计算。读侧只能读这个原子量，
+        // 绝不能去访问 conns_ —— 那张表没有锁，是事件循环线程的私有状态。
+        active_conns_.store(conns_.size(), std::memory_order_relaxed);
+
         const auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sweep).count() >=
             kSweepIntervalMs) {
@@ -408,7 +506,8 @@ void HttpServer::handle_read(int fd) {
     }
 
     HttpRequest req;
-    int rc = parse_request(buf, req);
+    std::size_t consumed = 0;
+    int rc = parse_request(buf, req, consumed);
     if (rc == 0 && !eof) {
         return; // 等待更多数据（空闲超时由 sweep_idle 兜底回收）
     }
@@ -419,6 +518,13 @@ void HttpServer::handle_read(int fd) {
         t.fd  = fd;
         t.req = std::move(req);
         t.req.remote_ip = it->second.remote_ip;  // 必须在 conns_.erase 之前取
+
+        // 缓冲区里若还有一条完整请求（HTTP pipelining），本次交接后这些字节就丢了。
+        // 本项目的客户端都是「一问一答」，不会走这条路径；但不能假装它不存在——
+        // 记下这个事实，让 handle_request 放弃 keep-alive 直接关连接，
+        // 客户端重连即可，比静默丢字节安全得多。
+        t.pipelined = buf.size() > consumed;
+
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         conns_.erase(fd);
         {
@@ -432,10 +538,14 @@ void HttpServer::handle_read(int fd) {
     // 报文非法（-1）、声明体过大（-2）或连接已关闭但请求不完整：直接断开。
     // 这里不做 400/413 回包——在事件循环线程上做阻塞写会拖慢整节点，
     // 价值不如立刻释放资源。
+    //
+    // 但必须记账：这类请求不会进入 handler，服务端指标里如果只统计「进过 handler 的」，
+    // 攻击者在指标上就是隐形的。
+    requests_dropped_.fetch_add(1, std::memory_order_relaxed);
     close_conn(fd);
 }
 
-void HttpServer::handle_request(int fd, HttpRequest req) {
+void HttpServer::handle_request(int fd, HttpRequest req, bool pipelined) {
     HttpResponse resp;
     resp.status = 200;
 
@@ -450,13 +560,84 @@ void HttpServer::handle_request(int fd, HttpRequest req) {
         resp.body   = "{\"error\":\"internal\"}";
     }
 
-    const std::string data = build_response(resp);
+    requests_total_.fetch_add(1, std::memory_order_relaxed);
+    if (resp.status >= 500) {
+        responses_5xx_.fetch_add(1, std::memory_order_relaxed);
+    } else if (resp.status >= 400) {
+        responses_4xx_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        responses_2xx_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const bool keep_alive = !pipelined && wants_keep_alive(req);
+    const std::string data = build_response(resp, keep_alive);
 
     // 阻塞写 + 发送超时：慢客户端最多占用 worker kSendTimeoutMs，之后放弃。
     set_nonblocking(fd, false);
     set_send_timeout(fd, kSendTimeoutMs);
-    write_all(fd, data);  // 返回 false 表示对端已关闭或写超时，属于正常结束
+    const bool wrote = write_all(fd, data);
+
+    // 只有「客户端明确要求复用」且「响应完整写出」才把连接交还事件循环。
+    // 写失败说明对端已关闭或写超时，复用毫无意义；关停过程中也不再挂回 epoll。
+    if (keep_alive && wrote && !stop_) {
+        recycle_conn(fd, req.remote_ip);
+        return;
+    }
     ::close(fd);
+}
+
+void HttpServer::recycle_conn(int fd, const std::string& remote_ip) {
+    // 工作线程为了阻塞写把 fd 设成了阻塞模式，交还前必须还原：
+    // 事件循环里的 recv 是非阻塞假设的，一个阻塞 fd 会把整个事件循环卡死。
+    set_nonblocking(fd, true);
+
+    {
+        std::lock_guard<std::mutex> lk(queue_mtx_);
+        recycled_.push_back(Recycled{fd, remote_ip});
+    }
+
+    // 立刻唤醒 epoll。不唤醒的话，这根连接要等 epoll_wait 的 100ms 超时才被重新注册，
+    // 复用连接省下的握手时间会被这 100ms 全部吃掉——那就白做了。
+    if (wake_fd_ >= 0) {
+        const std::uint64_t one = 1;
+        // EAGAIN 说明计数器已满，即已经处于「待唤醒」状态，无需再处理。
+        const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
+        (void)n;
+    }
+}
+
+void HttpServer::drain_recycled() {
+    std::deque<Recycled> pending;
+    {
+        std::lock_guard<std::mutex> lk(queue_mtx_);
+        if (recycled_.empty()) {
+            return;
+        }
+        pending.swap(recycled_);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& r : pending) {
+        // 已进入关停流程或连接数已达上限：不再挂回 epoll，直接关闭。
+        if (stop_ || conns_.size() >= kMaxConns) {
+            ::close(r.fd);
+            continue;
+        }
+
+        struct epoll_event cev;
+        std::memset(&cev, 0, sizeof(cev));
+        cev.events = EPOLLIN;
+        cev.data.fd = r.fd;
+        if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, r.fd, &cev) != 0) {
+            ::close(r.fd);
+            continue;
+        }
+
+        Conn conn;
+        conn.remote_ip   = std::move(r.remote_ip);
+        conn.last_active = now;
+        conns_[r.fd]     = std::move(conn);
+    }
 }
 
 void HttpServer::worker_loop() {
@@ -472,7 +653,9 @@ void HttpServer::worker_loop() {
             t = std::move(queue_.front());
             queue_.pop_front();
         }
-        handle_request(t.fd, std::move(t.req));
+        // 先取值再 move：避免依赖实参求值顺序（move 之后 t 处于未指定状态）。
+        const bool pipelined = t.pipelined;
+        handle_request(t.fd, std::move(t.req), pipelined);
     }
 }
 
@@ -509,6 +692,20 @@ void HttpServer::cleanup() {
         ::close(kv.first);
     }
     conns_.clear();
+    active_conns_.store(0, std::memory_order_relaxed);
+
+    // 事件循环退出后，仍可能有工作线程交还但未被 drain 的连接。
+    {
+        std::deque<Recycled> pending;
+        {
+            std::lock_guard<std::mutex> lk(queue_mtx_);
+            pending.swap(recycled_);
+        }
+        for (auto& r : pending) {
+            ::close(r.fd);
+        }
+    }
+
     if (reserve_fd_ >= 0) {
         ::close(reserve_fd_);
         reserve_fd_ = -1;

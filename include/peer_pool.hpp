@@ -39,7 +39,23 @@ public:
     //
     // 用途：决定是否信任 X-DCache-Hops 这类「内部语义头」。外部客户端可以随意伪造该头，
     // 若不加来源校验，就能强制任意节点绕过一致性哈希直接回源，把流量全压到数据源。
+    //
+    // 注意：IP 判定只能挡住「集群外的机器」，挡不住同机/同网段的其他进程（NAT 后共享 IP
+    // 更是全部互通）。真正可靠的判据是 SetAuthToken 配置的共享 token。
     bool IsTrustedHost(const std::string& host) const;
+
+    // 内部共享 token。为空表示不校验（仅限单机开发）。
+    void SetAuthToken(std::string token);
+    std::string AuthToken() const;
+
+    // 是否为可信的内部请求（决定能否采信 X-DCache-Hops）。
+    //
+    //   配置了 token：只认 token（常量时间比较），IP 不参与判定；
+    //   未配置 token：退回 IP 判定，且调用方应打印一次告警。
+    //
+    // 之所以「配置了 token 就不再参考 IP」，是因为两者取或等于取最弱的那一个：
+    // 只要还有一个可绕过的通道，攻击者就会走那条路。
+    bool IsTrustedRequest(const std::string& remote_ip, const std::string& token_header) const;
 
     const std::string& Self() const { return self_; }
     int VirtualNodes() const;
@@ -63,8 +79,11 @@ private:
     std::shared_ptr<const ConsistentHash> ring_;
 
     // peers 的 host 集合，独立于 ring_ 的锁（只保护自己的小集合，不与环重建产生锁序问题）。
+    // auth_token_ 复用同一把锁：两者都只在「内部请求判定」这条路径上读，
+    // 写只在启动时发生一次，争用可以忽略。
     mutable std::mutex              peers_mtx_;
     std::unordered_set<std::string> peer_hosts_;
+    std::string                     auth_token_;
 };
 
 } // namespace dcache

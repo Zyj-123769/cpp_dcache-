@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 
+#include "auth.hpp"
 #include "http_client.hpp"
 #include "json.hpp"
 #include "url.hpp"
@@ -76,6 +77,27 @@ bool HttpPeerPool::IsTrustedHost(const std::string& host) const {
     return peer_hosts_.find(host) != peer_hosts_.end();
 }
 
+void HttpPeerPool::SetAuthToken(std::string token) {
+    std::lock_guard<std::mutex> lk(peers_mtx_);
+    auth_token_ = std::move(token);
+}
+
+std::string HttpPeerPool::AuthToken() const {
+    std::lock_guard<std::mutex> lk(peers_mtx_);
+    return auth_token_;
+}
+
+bool HttpPeerPool::IsTrustedRequest(const std::string& remote_ip,
+                                    const std::string& token_header) const {
+    std::lock_guard<std::mutex> lk(peers_mtx_);
+
+    if (!auth_token_.empty()) {
+        // 配了 token 就只认 token。此时 IP 判定不再参与——两者取或等于取最弱的那个。
+        return ConstantTimeEquals(auth_token_, token_header);
+    }
+    return !remote_ip.empty() && peer_hosts_.find(remote_ip) != peer_hosts_.end();
+}
+
 std::string HttpPeerPool::PickPeer(const std::string& key) const {
     auto ring = Snapshot();
     if (!ring) {
@@ -102,6 +124,17 @@ GetResult HttpPeerPool::GetFromPeer(const std::string& peer, const std::string& 
     std::map<std::string, std::string> headers;
     if (hops > 0) {
         headers["X-DCache-Hops"] = std::to_string(hops);
+    }
+
+    // 内部共享 token。即使 hops==0 也一并发送：接收方判定「可信」的依据就是这个头，
+    // 与是否需要跳数无关；如果只在 hops>0 时发送，接收方就无法区分「内部请求」与「外部请求」。
+    //
+    // ⚠ 局限：节点间是明文 HTTP，token 在网络上是可见的。这里解决的是「外部客户端
+    // 无法伪造内部语义」的应用层信任问题，不能替代传输层加密。跨不可信网络部署时，
+    // 应在节点间加 TLS 或走内网隔离。
+    const std::string token = AuthToken();
+    if (!token.empty()) {
+        headers["X-DCache-Token"] = token;
     }
 
     int http_status = 0;
