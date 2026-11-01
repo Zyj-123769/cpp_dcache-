@@ -124,6 +124,7 @@
 - [ ] 并发用例是否有「栅栏 + 慢函数」构造竞争窗口，而不是靠 sleep 撞运气？
 - [ ] 断言是否检查了**行为**而非实现细节？
 - [ ] 是否考虑加入 TSan 任务（并发代码必须有）
+- [ ] 新增的解析逻辑是否在 fuzz 覆盖范围内（`fuzz/` 三目标必须跟着改，否则新分支等于没测）
 
 ### 5.8 文档
 
@@ -139,20 +140,20 @@
 | 编译告警 | `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | 0 warning，加 `-Werror` | 前四个已开，`-Wconversion` 未开 ⚠️ |
 | 格式 | `clang-format`（已提供 `.clang-format`） | 零 diff | 已实跑，全仓零 diff ✅（版本钉死 23.1.3） |
 | 静态分析 | `clang-tidy`（已提供 `.clang-tidy`） | P0 级诊断 0 条 | 已实跑通过 ✅ |
-| 单元测试 | `ctest` | 100% 通过 | 6/6 通过 ✅（含 12 段并发/异常/协议回归） |
+| 单元测试 | `ctest` | 100% 通过 | 7/7 通过 ✅（含 12 段并发/异常/协议回归 + 10 条解析器边界） |
 | 内存/UB | ASan + UBSan | 0 error | 已实跑，零报告 ✅ |
 | 数据竞争 | TSan | 0 warning | 已实跑，零报告 ✅ |
 | 覆盖率 | `gcovr`（`scripts/ci.sh coverage`） | 行覆盖率 ≥ 75% | 已实跑 ✅（**79%**：1795 行中 1425 行被执行） |
-| 模糊测试 | libFuzzer（`json`/`url`/`http` 解析器） | 无 crash | 缺失 ❌ |
+| 模糊测试 | libFuzzer（`scripts/ci.sh fuzz`） | 无 crash / 不变式成立 | 已实跑 ✅（json / url / http_request 各 30s） |
 
 > 这张表里「配了但没跑」比「缺失」更危险：缺失你知道没有，配了没跑却容易被当成已通过。
 > 本项目的 `.clang-format` 就在仓库里躺了四批才被真正执行，首跑直接报出 32 个文件不合规；
 > 同一轮 CI 还揪出一条**恒真断言**（断言写法命中了 `# HELP` 行，永远返回 0）。
 > **「门禁已达标」只有在 CI 绿过之后才成立。**
 
-CI 建议拆成 5 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` / `lint` / `coverage`。
+CI 拆成 6 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` / `lint` / `coverage` / `fuzz`。
 
-**构建命令只写一份。** 五个 job 都调用 `scripts/ci.sh <build|asan|tsan|lint|coverage>`，CI 配置里只声明「在哪个 runner 上跑哪一项」。这样换平台（GitHub Actions → Gitee Go / Jenkins / 云效）时改的是平台方言，构建逻辑不动，也不会出现「一边加了 Sanitizer、另一边忘了」的漂移。
+**构建命令只写一份。** 六个 job 都调用 `scripts/ci.sh <build|asan|tsan|lint|coverage|fuzz>`，CI 配置里只声明「在哪个 runner 上跑哪一项」。这样换平台（GitHub Actions → Gitee Go / Jenkins / 云效）时改的是平台方言，构建逻辑不动，也不会出现「一边加了 Sanitizer、另一边忘了」的漂移。
 
 ### 6.1 覆盖率门禁是怎么设计的（以及三个坑）
 
@@ -175,6 +176,40 @@ CI 建议拆成 5 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `t
 
 还有一条不能踩：**覆盖率和 Sanitizer 不要一起开**。Sanitizer 下进程异常退出会丢掉
 `.gcda`，覆盖率会莫名偏低，这类「工具互相干扰」的假信号最难查。
+
+### 6.2 模糊测试：fuzz 的价值全在断言上
+
+覆盖率门禁回答的是「该跑的都跑了吗」，回答不了「喂垃圾会怎样」。三个手写解析器
+（`json` / `url` / HTTP 请求行）是全项目**唯一直接吞不可信外部字节**的地方，
+其余模块吃的是自己进程内的数据——所以 fuzz 目标只挑这三个，不是图省事。
+
+四个刻意的选择：
+
+1. **解析器必须能被单独调用。** `ParseRequest` 原本藏在 `http_server.cpp` 的匿名命名空间里，
+   想测它只能起一个真 socket；而「声明体超过 64KB」这种分支，集成测试**根本发不出去**
+   （服务端在读缓冲超限时就把连接关了，压根走不到解析）。所以先把它拆成
+   `src/http_parser.cpp`，再用 `tests/test_http_parser.cpp` 直调 10 条边界。
+   **可测性是设计属性，不是事后补的。**
+2. **库必须一起插桩**（`-fsanitize=fuzzer-no-link`）。只给 fuzz 目标插桩、库不插的话，
+   fuzzer 看不到任何「哪些分支走到过」的信息，退化成纯随机字节生成器——
+   跑十分钟的随机测试未必比手写用例强。
+3. **断言检查的是不变式，不是「别崩」。** 只求不崩的话，一个返回垃圾结果但不越界的解析器
+   会被判为「通过」。这里断的是行为：编码后必须能原样解码回来（往返一致）、
+   同一段字节解析两次结论必须相同（幂等）、请求收到一半时只能回答「还要更多」（前缀性质）。
+   最后一条尤其重要——半包是 TCP 的常态，破坏了它，服务端会在半包到达时直接丢请求。
+4. **CI 只跑 30 秒**（`FUZZ_SECONDS`）。CI 挡的是「几秒就能撞出来」的崩；
+   深度 fuzz 是本地或夜间任务的事，把它塞进每次提交只会让反馈变慢。
+
+另外两个工程细节：
+
+- **语料放在构建目录里跑**，不直接写 `fuzz/corpus/`。libFuzzer 会持续往「第一个语料目录」写新样本，
+  指向源码树的话，每次本地跑完都多出一堆未跟踪文件，很快就会有人把整个语料目录删掉。
+- **`fuzz/corpus/http_request/*` 在 `.gitattributes` 里标了 `-text`。** 仓库默认 `* text=auto eol=lf`，
+  不豁免的话每次检出都会把 CRLF 改成 LF —— 种子本身就不是合法请求了，
+  fuzzer 等于从一堆废样本起步。
+
+> 结论写进注解，和覆盖率那节同理：`::notice::` / `::error::` 带 `cov:` `ft:` 或崩溃原因，
+> 不需要 admin 权限就能取到。只写「通过」而不说跑了多少次、覆盖多少边，和「配了没跑」没有区别。
 
 **平台选择要注意的一点：** 本仓库主仓在 Gitee，但 `.github/workflows/ci.yml` 是 GitHub Actions 的格式，**Gitee 不会执行它**。Gitee Go 挂在企业版下（可免费开通企业试用），且执行自定义脚本的 `shell@agent` 步骤需要自备 Linux 主机接入主机组 —— 个人仓库指望「云端免费跑 ctest」是走不通的。因此 CI 实际生效需要满足其一：
 
@@ -242,6 +277,7 @@ CI 建议拆成 5 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `t
 
 **长期（常态化）**
 8. 每月出一次评分卡 + 度量表
-9. `json`/`url`/`http` 三个手写解析器加 libFuzzer
+9. `json`/`url`/`http` 三处解析器加 libFuzzer — ✅ 已完成（第 6 批）
 10. 节点间 TLS（内部 token 目前明文，同网段可嗅探）
 11. worker 阻塞模型改非阻塞/协程（当前一个慢客户端占一个 worker）
+12. fuzz 语料入库（把 CI 跑出来的高价值样本提交回 `fuzz/corpus/`），并考虑夜间长跑

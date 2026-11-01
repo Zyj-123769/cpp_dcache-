@@ -41,6 +41,21 @@ FUZZ_SECONDS="${FUZZ_SECONDS:-30}"
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
+# report <error|notice|warning> <标题> <正文>
+#
+# 把结论写成 GitHub Actions 的注解。理由是踩过两次的同一个坑：job 日志要仓库
+# admin 权限才读得到，协作者只看到一个红叉；而注解有**公开 API**：
+#   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
+# 没有这一步，「CI 通过」就只是句口头承诺——连跑了多少次、覆盖多少边都拿不到。
+# 本地跑时什么都不做，避免往终端里灌一堆 ::notice:: 垃圾。
+report() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    local level="$1" title="$2" body="$3"
+    # 注解正文不能带换行，超长会被截断，先压平再截。
+    body="$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-400)"
+    printf '::%s title=%s::%s\n' "$level" "$title" "$body"
+}
+
 # configure_build_test <名称> <构建目录> [cmake 额外参数...]
 configure_build_test() {
     local name="$1" dir="$2"
@@ -155,15 +170,27 @@ do_fuzz() {
     fi
 
     log "[fuzz] 配置"
-    cmake -S . -B "$dir" \
+    local cfg_log="$dir/configure.log"
+    if ! cmake -S . -B "$dir" \
         -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DDCACHE_FUZZ=ON
+        -DDCACHE_FUZZ=ON >"$cfg_log" 2>&1; then
+        cat "$cfg_log"
+        report error "fuzz 配置失败" "$(grep -iE 'error' "$cfg_log" | head -5)"
+        return 1
+    fi
 
     log "[fuzz] 构建 fuzz 目标（-j $JOBS）"
     # 只构建 fuzz 目标：这个构建里的单元测试没有意义（它们同样带着 fuzzer 覆盖率插桩，
     # 跑起来只是更慢），少编 7 个可执行文件能省掉一半时间。
-    cmake --build "$dir" -j "$JOBS" --target fuzz_json fuzz_url fuzz_http_request
+    local build_log="$dir/build.log"
+    if ! cmake --build "$dir" -j "$JOBS" --target fuzz_json fuzz_url fuzz_http_request \
+        >"$build_log" 2>&1; then
+        cat "$build_log"
+        # 编译错误同样只在日志里，而日志要 admin 权限——把关键几行打成注解。
+        report error "fuzz 构建失败" "$(grep -E 'error:' "$build_log" | head -5)"
+        return 1
+    fi
 
     local rc=0
     local name
@@ -179,12 +206,21 @@ do_fuzz() {
         fi
 
         log "[fuzz] ${name}（预算 ${FUZZ_SECONDS}s）"
-        if ! "$exe" -max_total_time="$FUZZ_SECONDS" -print_final_stats=1 "$corpus"; then
+        # 输出落盘再回放：失败时要从中捞出崩溃原因，别指望人眼在几千行里找。
+        local log_file="$dir/fuzz-${name}.log"
+        if ! "$exe" -max_total_time="$FUZZ_SECONDS" -print_final_stats=1 "$corpus" >"$log_file" 2>&1; then
+            cat "$log_file"
             echo "" >&2
             echo "fuzz 目标 fuzz_${name} 报告了崩溃或不变式失败。" >&2
             echo "崩溃样本已写到仓库根目录的 crash-*，复现方式：$exe crash-xxx" >&2
+            report error "fuzz-${name} 失败" "$(grep -E '不变式|ERROR|SUMMARY|artifact_prefix' "$log_file" | head -6)"
             rc=1
+            continue
         fi
+        # 成功也留证据：只写「通过」而不说跑了多少次、覆盖了多少边，
+        # 和「配了没跑」没有区别。cov/ft 就是 libFuzzer 自己报的边覆盖与特征数。
+        cat "$log_file"
+        report notice "fuzz-${name} 通过" "$(grep -E '^(Done|cov:)' "$log_file" | tail -2)"
     done
     return "$rc"
 }

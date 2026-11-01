@@ -90,23 +90,26 @@ ctest --test-dir build --output-on-failure
 可选 Sanitizer：`cmake -S . -B build -DDCACHE_SANITIZE=address,undefined`。
 可选覆盖率：`cmake -S . -B build-cov -DCMAKE_BUILD_TYPE=Debug -DDCACHE_COVERAGE=ON`，
 或直接 `bash scripts/ci.sh coverage`（自动配置 + 跑测 + `gcovr` 卡 75% 行覆盖率）。
+可选 fuzz：`cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DDCACHE_FUZZ=ON`
+（需要 clang），或直接 `bash scripts/ci.sh fuzz`（三个目标各跑 30s，`FUZZ_SECONDS` 可调）。
 
 ### 方式三：一键跑全部门禁
 
 ```bash
-bash scripts/ci.sh all     # build -> asan -> tsan -> lint -> coverage
+bash scripts/ci.sh all     # build -> asan -> tsan -> lint -> coverage -> fuzz
 ```
 
-CI（`.github/workflows/ci.yml`）的五个 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
+CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
 除了平台差异（Linux vs Windows）之外，两边不会有第二套命令。
 
 > 双远端：GitHub 为主仓（CI 跑在这里），Gitee 为国内镜像。
 > Gitee 不执行 `.github/workflows/`（Gitee Go 需企业版且自定义 shell 要自备 Linux 主机），
 > 所以门禁只在 GitHub 生效，详见 `docs/CODE_REVIEW_GUIDE.md` 第 6 节。
 >
-> CI 状态：五个 job（build / asan+ubsan / tsan / lint / coverage）已全部实跑通过。
+> CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
-> **行覆盖率 79%**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）。
+> **行覆盖率 79%**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
+> **三个 libFuzzer 目标**（json / url / HTTP 请求行）在不变式断言下无崩溃。
 > 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读。
 
 
