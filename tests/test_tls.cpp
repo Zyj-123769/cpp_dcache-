@@ -2,9 +2,11 @@
 #include <netinet/in.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -392,9 +394,7 @@ int main() {
 
         std::shared_ptr<Node> nodeA;
         std::shared_ptr<Node> nodeB;
-        auto getter = [](const std::string& key) -> GetResult {
-            return GetResult(true, "v:" + key);
-        };
+        auto getter = [](const std::string& k) -> GetResult { return GetResult(true, "v:" + k); };
 
         HttpServer sA;
         HttpServer sB;

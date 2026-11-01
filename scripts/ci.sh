@@ -52,7 +52,7 @@ report() {
     [ -n "${GITHUB_ACTIONS:-}" ] || return 0
     local level="$1" title="$2" body="$3"
     # 注解正文不能带换行，超长会被截断，先压平再截。
-    body="$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-400)"
+    body="$(printf '%s' "$body" | tr '\n' ' ' | cut -c1-900)"
     printf '::%s title=%s::%s\n' "$level" "$title" "$body"
 }
 
@@ -73,13 +73,18 @@ configure_build_test() {
 
     log "[$name] 构建（-j $JOBS）"
     if ! cmake --build "$dir" -j "$JOBS" 2>&1 | tee "$dir/build.log"; then
-        # 编译错误只在日志里，而日志要仓库 admin 权限才读得到。
-        # 把最后几行打成注解，失败原因就变成了匿名可读的——否则我只能看到
-        # 一个红叉，然后靠猜着改。这条通道不是给「好看的报告」用的，
-        # 是为了让诊断不必依赖权限。
+        # 编译错误只在日志里，而日志要仓库 admin 权限才读得到。把失败原因打成注解，
+        # 诊断就不再依赖权限——否则我只能看到一个红叉，然后靠猜着改。
+        # 分两条：先给「哪个文件几条错误」的全局视图（不会被截断带偏），再给原文。
+        local per_file
+        per_file="$(grep -oE '[^ /]+\.(cpp|hpp|tpp):[0-9]+:[0-9]+: error:' "$dir/build.log" |
+            cut -d: -f1 | sort | uniq -c | tr '\n' ' ' || true)"
+        report error "[$name] 构建失败（按文件）" "${per_file:-没有匹配到编译器错误行}"
+
+        # 再报前几条原文。诊断不该依赖仓库权限，所以这些必须出现在注解里。
         local why
-        why="$(grep -E 'error:|Error' "$dir/build.log" | head -5 | tr '\n' ' ' || true)"
-        report error "[$name] 构建失败" "$why"
+        why="$(grep -E 'error:' "$dir/build.log" | head -6 | tr '\n' ' ' || true)"
+        report error "[$name] 构建失败（原文）" "$why"
         return 1
     fi
 

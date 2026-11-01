@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -396,20 +397,26 @@ private:
     }
 
     // 清掉超过 TTL 的空闲连接（调用方须持锁）。
+    //
+    // 用 erase 而不是「原地往前挪」的经典写法：IdleConn 带着 unique_ptr，
+    // 挪动必须用移动赋值/swap，写成 list[kept++] = list[i] 会退化成拷贝赋值
+    // ——而拷贝已经被 unique_ptr 删掉了，编译器报的是「use of deleted function」，
+    // 很容易被误读成「IdleConn 不可拷贝」这种设计问题。
+    // 每个 host 最多 kMaxIdlePerHost(8) 条，O(n²) 在这里没有意义。
     void PurgeLocked() {
         const auto now = std::chrono::steady_clock::now();
         for (auto it = idle_.begin(); it != idle_.end();) {
             std::vector<IdleConn>& list = it->second;
-            std::size_t kept            = 0;
-            for (std::size_t i = 0; i < list.size(); ++i) {
+            std::size_t i               = 0;
+            while (i < list.size()) {
                 if (IdleAgeMs(now, list[i].since) < kIdleTtlMs) {
-                    list[kept++] = list[i];
-                } else {
-                    ::close(list[i].fd);
-                    --total_;
+                    ++i;
+                    continue;
                 }
+                ::close(list[i].fd);  // 会话由被删元素的析构释放
+                list.erase(list.begin() + static_cast<std::ptrdiff_t>(i));
+                --total_;
             }
-            list.resize(kept);
             if (list.empty()) {
                 it = idle_.erase(it);
             } else {
