@@ -142,7 +142,7 @@
 | 单元测试 | `ctest` | 100% 通过 | 6/6 通过 ✅（含 12 段并发/异常/协议回归） |
 | 内存/UB | ASan + UBSan | 0 error | 已实跑，零报告 ✅ |
 | 数据竞争 | TSan | 0 warning | 已实跑，零报告 ✅ |
-| 覆盖率 | `gcov/lcov` | 新增代码 ≥ 80% | 缺失 ❌ |
+| 覆盖率 | `gcovr`（`scripts/ci.sh coverage`） | 行覆盖率 ≥ 75% | 已实跑 ✅（**79%**：1795 行中 1425 行被执行） |
 | 模糊测试 | libFuzzer（`json`/`url`/`http` 解析器） | 无 crash | 缺失 ❌ |
 
 > 这张表里「配了但没跑」比「缺失」更危险：缺失你知道没有，配了没跑却容易被当成已通过。
@@ -150,9 +150,31 @@
 > 同一轮 CI 还揪出一条**恒真断言**（断言写法命中了 `# HELP` 行，永远返回 0）。
 > **「门禁已达标」只有在 CI 绿过之后才成立。**
 
-CI 建议拆成 4 个 job：`build-and-test` / `sanitize-asan-ubsan` / `sanitize-tsan` / `lint`。
+CI 建议拆成 5 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` / `lint` / `coverage`。
 
-**构建命令只写一份。** 四个 job 都调用 `scripts/ci.sh <build|asan|tsan|lint>`，CI 配置里只声明「在哪个 runner 上跑哪一项」。这样换平台（GitHub Actions → Gitee Go / Jenkins / 云效）时改的是平台方言，构建逻辑不动，也不会出现「一边加了 Sanitizer、另一边忘了」的漂移。
+**构建命令只写一份。** 五个 job 都调用 `scripts/ci.sh <build|asan|tsan|lint|coverage>`，CI 配置里只声明「在哪个 runner 上跑哪一项」。这样换平台（GitHub Actions → Gitee Go / Jenkins / 云效）时改的是平台方言，构建逻辑不动，也不会出现「一边加了 Sanitizer、另一边忘了」的漂移。
+
+### 6.1 覆盖率门禁是怎么设计的（以及三个坑）
+
+`-DDCACHE_COVERAGE=ON` 打开 `--coverage -O0 -g`，`gcovr --fail-under-line` 卡 75%。
+首跑实测 **79%**（1795 行可执行代码中 1425 行被执行）。地板值取 75 而不是 79：
+留 3 个点给工具版本差异（`gcovr`/`gcc` 的计数口径会小幅漂移），
+超过这个余量的下跌只可能是真的少测了。再往上抬按「实测 − 3」逐步收紧。
+
+设计上有三个刻意的选择：
+
+1. **只统计 `src/` 与 `include/`，排除 `tests/` 与 `apps/`。** 用测试文件给测试打分没有意义；
+   `apps/` 是入口，靠手工跑，覆盖率天然低，混进来只会稀释信号。
+2. **必须单判一次「报告为空」。** `gcovr` 在「一个文件都没匹配到」时不报错，输出一张
+   0/0 的空表——**看起来和 100% 一样漂亮**，`--fail-under-line` 也可能直接放行。
+   这和第十一节那条「恒真断言」是同一类错误：门禁看起来在拦，实际什么都没拦。
+3. **数字要能被机器取走。** job 日志需要仓库 admin 权限，job summary 只能人眼看。
+   所以 workflow 额外把 `TOTAL` 行打成一条 **annotation**（`::notice::`），
+   它能用匿名 API 读到：
+   `GET /repos/{owner}/{repo}/check-runs/{id}/annotations`。
+
+还有一条不能踩：**覆盖率和 Sanitizer 不要一起开**。Sanitizer 下进程异常退出会丢掉
+`.gcda`，覆盖率会莫名偏低，这类「工具互相干扰」的假信号最难查。
 
 **平台选择要注意的一点：** 本仓库主仓在 Gitee，但 `.github/workflows/ci.yml` 是 GitHub Actions 的格式，**Gitee 不会执行它**。Gitee Go 挂在企业版下（可免费开通企业试用），且执行自定义脚本的 `shell@agent` 步骤需要自备 Linux 主机接入主机组 —— 个人仓库指望「云端免费跑 ctest」是走不通的。因此 CI 实际生效需要满足其一：
 
@@ -213,11 +235,13 @@ CI 建议拆成 4 个 job：`build-and-test` / `sanitize-asan-ubsan` / `sanitize
 3. ✅ 修复报告中的 6 个 P0（另修 6 个连接层缺陷）
 
 **第 2–4 周（固化）**
-4. CI 增加 TSan job；Sanitizer 改为全局插桩
-5. 补齐失败路径测试（超时 / 500 / 半包 / 慢客户端 / 重启）
-6. 建立 PR 分级标注习惯，跑一轮完整流程试运行
+4. CI 增加 TSan job；Sanitizer 改为全局插桩 — ✅ 已完成
+5. 补齐失败路径测试（超时 / 500 / 半包 / 慢客户端 / 重启）— ✅ 已完成（12 段回归）
+6. 覆盖率门禁（gcovr + 地板值 + 注解回传数字）— ✅ 已完成（第 5 批）
+7. 建立 PR 分级标注习惯，跑一轮完整流程试运行 — ⏳ 待多人协作时验证
 
 **长期（常态化）**
-7. 每月出一次评分卡 + 度量表
-8. `json`/`url`/`http` 三个手写解析器加 libFuzzer
-9. 引入 `GetResult` 三态改造，统一错误契约
+8. 每月出一次评分卡 + 度量表
+9. `json`/`url`/`http` 三个手写解析器加 libFuzzer
+10. 节点间 TLS（内部 token 目前明文，同网段可嗅探）
+11. worker 阻塞模型改非阻塞/协程（当前一个慢客户端占一个 worker）

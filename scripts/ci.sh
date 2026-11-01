@@ -17,7 +17,7 @@
 #
 # 环境变量：
 #   JOBS               并行度，默认取 CPU 核数
-#   COVERAGE_MIN_LINE  行覆盖率门槛（百分比），默认 60
+#   COVERAGE_MIN_LINE  行覆盖率门槛（百分比），默认 75
 
 set -euo pipefail
 
@@ -26,10 +26,11 @@ cd "$ROOT"
 
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 
-# 覆盖率门槛。60 是「不许倒退」的地板值，不是目标值：本仓库当前实测值见
-# docs/CODE_REVIEW_GUIDE.md 第 6 节。收紧门槛要单独提交并写明原因，
-# 放宽门槛则必须在 PR 描述里解释为什么这次测出来的低覆盖是合理的。
-COVERAGE_MIN_LINE="${COVERAGE_MIN_LINE:-60}"
+# 覆盖率门槛（行覆盖率百分比）。75 是「不许倒退」的地板：首跑实测 79%，
+# 留 3 个点给工具版本差异（gcovr/gcc 的计数口径会小幅漂移），
+# 超过这个余量的下跌只可能是真的少测了。收紧要单独提交并写明原因；
+# 放宽必须在 PR 里解释为什么这次的低覆盖是合理的。
+COVERAGE_MIN_LINE="${COVERAGE_MIN_LINE:-75}"
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
