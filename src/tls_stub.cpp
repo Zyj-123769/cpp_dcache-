@@ -66,6 +66,13 @@ long Session::Read(void* buf, std::size_t len, Io& io) {
     return -1;
 }
 
+long Session::Write(const void* data, std::size_t len, Io& io) {
+    (void)data;
+    (void)len;
+    io = Io::kFailed;
+    return -1;
+}
+
 bool Session::WriteAll(const void* data, std::size_t len) {
     (void)data;
     (void)len;

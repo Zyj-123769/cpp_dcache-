@@ -52,6 +52,18 @@ int clamp_len(std::size_t len) {
     return len > static_cast<std::size_t>(INT_MAX) ? INT_MAX : static_cast<int>(len);
 }
 
+// 非阻塞写必须打开的两个模式，缺一个都会等到「响应写到一半」时才炸：
+//   - ENABLE_PARTIAL_WRITE：允许 SSL_write 写出一部分就返回。默认模式下它要么
+//     把整块写完、要么 WANT_WRITE，一条 8MB 的响应就得靠 OpenSSL 内部把剩下的
+//     全缓存住——缓冲多少由对端读得多快决定，等于把内存交给了对端。
+//   - ACCEPT_MOVING_WRITE_BUFFER：WANT_WRITE 之后允许换一块缓冲区重试。
+//     默认模式下 OpenSSL 要求「原样重试同一块内存」，而事件循环下一次是从
+//     out_off 这个新偏移量开始的，指针必然变了——不开这个模式会拿到
+//     "bad write retry" 并直接掐断连接。
+void apply_io_modes(SSL* ssl) {
+    ::SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+}
+
 // OpenSSL 的默认 BIO 用 write(2)，不像本项目自己的 send_all / write_all 那样
 // 带 MSG_NOSIGNAL。于是「客户端发完请求立刻断开，服务端正在写响应」这种再正常
 // 不过的行为会让进程收到 SIGPIPE 直接退出 —— **一个客户端就能杀掉节点**。
@@ -201,6 +213,8 @@ std::unique_ptr<Session> Session::Accept(Context& ctx, int fd) {
     if (ssl == nullptr) {
         return nullptr;
     }
+    // 服务端也要带上：响应是由事件循环用非阻塞写发出去的（见 flush_conn）。
+    apply_io_modes(ssl);
     if (::SSL_set_fd(ssl, fd) != 1) {
         ::SSL_free(ssl);
         return nullptr;
@@ -237,6 +251,10 @@ std::unique_ptr<Session> Session::Connect(Context& ctx, int fd, const std::strin
         }
     }
 
+    // 客户端这边目前走的是阻塞的 WriteAll，两个模式用不上；仍然一起打开，
+    // 是为了不让「服务端非阻塞、客户端阻塞」变成一条隐形的差异——
+    // 哪天转发路径也改成非阻塞写，不会因为漏了这两行而出现 bad write retry。
+    apply_io_modes(ssl);
     if (::SSL_set_fd(ssl, fd) != 1) {
         ::SSL_free(ssl);
         return nullptr;
@@ -299,6 +317,45 @@ long Session::Read(void* buf, std::size_t len, Io& io) {
             // 上层只会保留已读到的完整请求，半截请求本来就要丢弃。
             io = Io::kClosed;
             return 0;
+        }
+        io = Io::kFailed;
+        return -1;
+    default:
+        io = Io::kFailed;
+        return -1;
+    }
+}
+
+long Session::Write(const void* data, std::size_t len, Io& io) {
+    if (len == 0) {
+        io = Io::kOk;
+        return 0;
+    }
+
+    ::ERR_clear_error();
+    SSL* ssl    = static_cast<SSL*>(ssl_);
+    const int n = ::SSL_write(ssl, data, clamp_len(len));
+    if (n > 0) {
+        io = Io::kOk;
+        return n;
+    }
+
+    switch (::SSL_get_error(ssl, n)) {
+    case SSL_ERROR_WANT_WRITE:
+        // socket 发送缓冲满了。调用方等 EPOLLOUT 后带着**新的偏移量**重试，
+        // 这就是 SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER 存在的理由（见 apply_io_modes）。
+        io = Io::kWantWrite;
+        return -1;
+    case SSL_ERROR_WANT_READ:
+        // TLS 1.3 的 KeyUpdate：写方向要先读掉对端的一条消息才能继续。
+        io = Io::kWantRead;
+        return -1;
+    case SSL_ERROR_SYSCALL:
+        // 非阻塞 fd 上的 EAGAIN 会落到这里，而不是 WANT_WRITE。
+        // 必须在失败分支之前判掉：否则一次正常的「缓冲满了」会被当成连接已死。
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            io = Io::kWantWrite;
+            return -1;
         }
         io = Io::kFailed;
         return -1;

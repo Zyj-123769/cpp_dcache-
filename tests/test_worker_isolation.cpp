@@ -105,9 +105,9 @@ std::string ReadWithin(int fd, int ms) {
         const int left = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
         struct pollfd p;
-        p.fd      = fd;
-        p.events  = POLLIN;
-        p.revents = 0;
+        p.fd        = fd;
+        p.events    = POLLIN;
+        p.revents   = 0;
         const int r = ::poll(&p, 1, left);
         if (r == 0) {
             return out;  // 到点
@@ -172,10 +172,9 @@ int main() {
         // 就是服务端还没来得及处理它。
         const auto started     = std::chrono::steady_clock::now();
         const std::string resp = ReadWithin(fast, 1500);
-        const long long cost =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started)
-                .count();
+        const long long cost   = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - started)
+                                     .count();
 
         // 修复前这里是空的：worker 正卡在 /big 的 send() 里，
         // /small 在队列里排到 2000ms 之后才可能有人取。

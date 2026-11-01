@@ -21,13 +21,25 @@ namespace dcache {
 // 极简非阻塞 epoll HTTP 服务器（Level-Triggered）+ 工作线程池。
 //
 // 设计取舍：
-//   - 事件循环线程只负责 accept / 读请求；完整的请求交给工作线程池处理，
+//   - 事件循环线程负责 accept / 读请求 / **写响应**；工作线程池只负责跑 handler
+//     （也就是唯一可能因为回源而变慢的那部分）。完整的请求交给工作线程，
 //     避免「同步转发 / 慢回源」在事件循环里阻塞整节点（连本地命中也被拖垮）
 //     的级联串行化问题；
-//   - 连接默认「处理完一条请求即关闭」；只有客户端显式发送 Connection: keep-alive
-//     时才保持连接（处理完把 fd 交还事件循环重新挂回 epoll）。
-//     做成显式 opt-in 而不是 HTTP/1.1 默认长连接，是为了让默认行为与改造前逐字节一致：
-//     新路径只在自己人之间启用，真出问题也炸不到普通客户端。
+//   - 写响应之所以也在事件循环里：写 socket 同样会阻塞（对端不读就写不完）。
+//     把它留在工作线程里，一个慢客户端就能按死一个 worker；改到事件循环之后，
+//     慢客户端只占一个 EPOLLOUT 关注位，代价是内存而不是并发能力。
+//     超时语义没变（写不动 kSendTimeoutMs 就回收），变的是「等的时候占着什么」。
+//
+// 一条 fd 在任意时刻只有一个所有者，这是整套生命周期能自洽的唯一依据：
+//   - 在 conns_ 里             -> 事件循环所有（close_conn / cleanup 关闭）
+//   - 在 queue_ 里的 Task 上    -> 工作线程所有（工作线程从不关闭它）
+//   - 在 completed_ 里         -> 事件循环所有；事件循环已退出时归 Stop()
+// 所以「谁该关这个 fd」永远只有一个答案，不存在两处都以为自己该关的窗口。
+//
+// 连接默认「处理完一条请求即关闭」；只有客户端显式发送 Connection: keep-alive
+// 时才保持连接（响应写完后重新挂回 epoll 等下一个请求）。
+// 做成显式 opt-in 而不是 HTTP/1.1 默认长连接，是为了让默认行为与改造前逐字节一致：
+// 新路径只在自己人之间启用，真出问题也炸不到普通客户端。
 class HttpServer {
 public:
     using Handler = std::function<void(const HttpRequest&, HttpResponse&)>;
@@ -94,7 +106,7 @@ private:
     struct Task {
         int fd = -1;
         // TLS 会话（明文模式下为 nullptr）。它必须跟着 fd 一起跨线程：
-        // 工作线程要用它写响应，而 SSL 对象只能有一个所有者。
+        // 工作线程处理完要把它连同响应一起交回来，而 SSL 对象只能有一个所有者。
         std::unique_ptr<tls::Session> ssl;
         HttpRequest req;
         // 本次读取的缓冲区里还有后续请求（pipelining）。有的话不能复用连接：
@@ -102,13 +114,19 @@ private:
         bool pipelined = false;
     };
 
-    // 工作线程处理完 keep-alive 请求后交还事件循环的连接。
-    // remote_ip 必须一起带回来：复用的连接上后续请求仍要做「是否内部请求」判定，
-    // 丢了它就会把对端降级成不可信来源。
-    struct Recycled {
+    // 工作线程交还给事件循环的成果：已拼好的整条响应 + 那条连接上的 TLS 会话。
+    //
+    // 为什么响应体要跟着回来、而不是工作线程自己写出去：写 socket 是有可能
+    // 阻塞的那一步（对端不读就写不完），把它放在工作线程里，一个慢客户端就能
+    // 按死一个 worker——四个就够让整节点不响应。改成「工作线程只产生字节、
+    // 事件循环负责写」之后，慢客户端只占一个 EPOLLOUT 关注位。
+    struct Completed {
         int fd = -1;
         std::unique_ptr<tls::Session> ssl;
+        // 复用连接后仍要做「是否内部请求」判定，所以来源 IP 必须跟着回来。
         std::string remote_ip;
+        std::string data;
+        bool keep_alive = false;
     };
 
     void run();
@@ -118,7 +136,7 @@ private:
     void cleanup();
 
     // 关闭连接（幂等）：已移交给工作线程的 fd 不在此表内，不会被重复 close。
-    // 会话对象由 Conn / Task / Recycled 三处的 unique_ptr 负责释放，
+    // 会话对象由 Conn / Task / Completed 三处的 unique_ptr 负责释放，
     // 这里只管从 conns_ 里摘除（erase 会顺带释放 SSL）。
     void close_conn(int fd);
 
@@ -126,14 +144,19 @@ private:
     // 漏切一次就是「连接挂到 10 秒空闲回收才断」或者「EPOLLOUT 水平触发空转」。
     bool set_interest(int fd, std::uint32_t events);
 
-    // 回收长时间不活动、请求还没收全的连接（slowloris 防护）。
+    // 回收长时间不活动、请求还没收全的连接（slowloris 防护），以及写不动了的连接。
     void sweep_idle();
 
-    // 工作线程：把处理完的 fd 交还事件循环（含唤醒 epoll）。
-    void recycle_conn(int fd, std::unique_ptr<tls::Session> ssl, const std::string& remote_ip);
+    // 工作线程：把「响应 + 会话」放进交接队列并唤醒事件循环。任意线程可调。
+    void queue_completed(Completed item);
 
-    // 事件循环：把交还的连接重新注册回 epoll。只能由事件循环线程调用。
-    void drain_recycled();
+    // 事件循环：把交接队列里的连接重新注册回 epoll 并立刻试写一次。
+    // 只能由事件循环线程调用。
+    void drain_completed();
+
+    // 事件循环：把 out 里剩下的字节往 socket 上推一次。返回 false 表示连接已关闭。
+    // 写不完时自己收敛 EPOLLOUT，不再需要工作线程陪着等。
+    bool flush_conn(int fd);
 
     struct Conn {
         std::string read_buf;
@@ -141,11 +164,25 @@ private:
         std::unique_ptr<tls::Session> ssl;
         bool handshaking = false;
 
-        // 最后一次收到数据的时刻。HTTP 请求就几十字节，正常情况下 10 秒内必然收完；
-        // 一直收不全的连接只会白占内存和 fd，必须主动回收。
+        // 「写回」阶段的状态。writing 为真时这条连接只关注 EPOLLOUT，
+        // 不再读新请求——一条连接同一时刻只处理一条请求，这句话以前靠
+        // 「fd 不在 conns_ 里」实现，现在靠这个标志。
+        std::string out;
+        std::size_t out_off = 0;
+
+        bool writing          = false;
+        bool keep_alive_after = false;
+
+        // 最后一次收到数据、或写出有进展的时刻。HTTP 请求就几十字节，正常情况下
+        // 10 秒内必然收完；一直收不全的连接只会白占内存和 fd，必须主动回收。
         // 握手阶段同样靠它兜底：没有单独的握手超时，因为 slowloris 在握手期
         // 和请求期是同一个问题（发一半就不动了），没必要写两套。
         std::chrono::steady_clock::time_point last_active;
+
+        // 写回的停滞截止时刻：每次写出有进展就顺延。
+        // 它取代了原来工作线程上的 SO_SNDTIMEO——超时语义没变（对端不读就别再占
+        // 资源），只是判超时的地方从 send() 挪到了扫描循环，于是不再占着 worker。
+        std::chrono::steady_clock::time_point write_deadline;
     };
 
     // 推进一次握手。返回 false 表示连接已关闭，调用方必须立刻返回。
@@ -194,7 +231,7 @@ private:
 
     // 工作线程 -> 事件循环 的单向交接队列。queue_mtx_ 同时保护它：
     // 两者都是「生产者/消费者」队列，没有嵌套持锁的路径，共用一个锁不会引入锁序问题。
-    std::deque<Recycled> recycled_;
+    std::deque<Completed> completed_;
 
     // 指标。写侧分散在事件循环线程与工作线程，读侧是任意调用方，
     // 因此一律用原子量而不是「读 conns_.size()」——conns_ 只有事件循环线程能碰。

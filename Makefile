@@ -21,7 +21,7 @@ OBJS := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SRCS))
 
 LDLIBS += $(TLSLIBS)
 
-TESTS := test_lru_cache test_consistent_hash test_singleflight test_json test_url test_http_parser test_node $(TLSTEST)
+TESTS := test_lru_cache test_consistent_hash test_singleflight test_json test_url test_http_parser test_node test_worker_isolation $(TLSTEST)
 
 .PHONY: all test clean
 
@@ -43,7 +43,7 @@ $(TESTS): test_%: tests/test_%.cpp $(OBJS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $< $(OBJS) $(LDLIBS)
 
 test: $(TESTS)
-	./test_lru_cache && ./test_consistent_hash && ./test_singleflight && ./test_json && ./test_url && ./test_http_parser && ./test_node $(if $(TLSTEST),&& ./$(TLSTEST))
+	./test_lru_cache && ./test_consistent_hash && ./test_singleflight && ./test_json && ./test_url && ./test_http_parser && ./test_node && ./test_worker_isolation $(if $(TLSTEST),&& ./$(TLSTEST))
 
 clean:
 	rm -rf $(BUILD) node bench $(TESTS)

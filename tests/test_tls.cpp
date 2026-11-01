@@ -409,9 +409,15 @@ private:
     int fd_       = -1;
 };
 
+// 「分片写出」用例的响应体大小。要大到一次 SSL_write 写不完，
+// 但不能超过 HttpClient 的 kMaxBodyBytes（8MB），否则客户端自己先拒绝。
+constexpr std::size_t kBigTlsBody = 4u * 1024u * 1024u;
+
 void ok_handler(const HttpRequest& req, HttpResponse& resp) {
     resp.status = 200;
-    resp.body   = "tls:" + req.path;
+    // /big-tls 专门用来逼出「一次 SSL_write 写不完」：4MB 在 TLS 上必然跨多个
+    // 记录、多次写调用，也就必然走到 WANT_WRITE 那一支。
+    resp.body = (req.path == "/big-tls") ? std::string(kBigTlsBody, 'z') : "tls:" + req.path;
 }
 
 }  // namespace
@@ -486,6 +492,17 @@ int main() {
 
         // 握手失败要记账：不记的话「对端没开 TLS」在监控上是隐形的。
         CHECK(s.GetMetrics().handshake_failures > before);
+
+        // ---- 2b. 大响应在 TLS 上必须分片写出且一字不差 ----
+        // 明文那条大响应用例（test_worker_isolation）验的是 send 的偏移量记账；
+        // 这条验的是 TLS 记录层：一次 SSL_write 写不完 -> WANT_WRITE ->
+        // 下一轮带着**新的偏移量**重试。没有 SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+        // 的话，这一步会得到 "bad write retry"，连接当场被掐断。
+        std::string big;
+        CHECK(HttpClient::Get("127.0.0.1", s.Port(), "/big-tls", big, 10000));
+        CHECK_EQ(big.size(), kBigTlsBody);
+        // 全是 'z'：偏移量算错时这里会混进上一段的重发字节或出现空洞。
+        CHECK(big.find_first_not_of('z') == std::string::npos);
 
         s.Stop();
         HttpClient::CloseIdleConnections();

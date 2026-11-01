@@ -5,7 +5,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -30,9 +29,22 @@ constexpr std::size_t kMaxConns = 8192;
 constexpr int kIdleTimeoutMs   = 10000;
 constexpr int kSweepIntervalMs = 1000;
 
-// 阻塞写响应的最长等待时间。没有它，一个「只发请求不读响应」的客户端
-// 就能让 send() 永久阻塞，几个连接即可占满全部 worker（廉价 DoS）。
+// 写回一条响应最多允许停滞多久。没有它，一个「只发请求不读响应」的客户端
+// 就能让这条连接永远挂在那里（连带那个 8MB 的响应缓冲）。
+//
+// 这个数原来是 SO_SNDTIMEO，含义是「工作线程被 send() 按住的时长」；
+// 现在写由事件循环做，它变成「连接上多久没有写出进展就回收」。
+// 数值不动是刻意的：公开行为（客户端能拖多久）保持不变，变的只是代价。
 constexpr int kSendTimeoutMs = 2000;
+
+// 一次 flush 最多推进多少字节就把事件循环让出去。
+//
+// 写本身是 memcpy，很快；但一条 8MB 的响应一口气推完，这一轮里其它连接的
+// 响应就会被推迟（事件循环是单线程的）。给个上限，让大响应和小响应在同一轮
+// 里公平分摊：多花的只是一次 epoll_wait 往返，换来的是延迟不随别人的响应体
+// 大小抖动。之所以能给上限，正是因为 EPOLLOUT 是水平触发的——
+// 注册着且没写完，下一轮一定会再进来。
+constexpr std::size_t kMaxBytesPerFlush = 256 * 1024;
 
 // 取头部值并做大小写不敏感比较（HTTP 头名与 Connection 的值都可能有大小写差异）。
 bool header_equals_ci(const HttpRequest& req, const char* name, const char* value) {
@@ -93,27 +105,6 @@ bool set_nonblocking(int fd, bool on) {
     else
         flags &= ~O_NONBLOCK;
     return ::fcntl(fd, F_SETFL, flags) == 0;
-}
-
-bool set_send_timeout(int fd, int ms) {
-    struct timeval tv;
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    return ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
-}
-
-bool write_all(int fd, const std::string& data) {
-    std::size_t off = 0;
-    while (off < data.size()) {
-        ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return false;
-        }
-        off += static_cast<std::size_t>(n);
-    }
-    return true;
 }
 
 }  // namespace
@@ -330,13 +321,14 @@ void HttpServer::Stop() {
 
     // ③ 兜底回收：正常路径下队列已被排空，异常路径下也避免残留任务泄漏 fd。
     std::deque<Task> leftover;
-    std::deque<Recycled> leftover_conns;
+    std::deque<Completed> leftover_conns;
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
         leftover.swap(queue_);
-        // keep-alive 连接同理：Stop 之后事件循环已经退出，没有人再 drain 它们。
-        // 工作线程若恰好在 Stop 之后才交还，这些 fd 只能在这里关闭。
-        leftover_conns.swap(recycled_);
+        // 已写好但还没写出去的响应同理：Stop 之后事件循环已经退出，
+        // 没有人再 drain 它们。工作线程若恰好在 Stop 之后才交还，
+        // 这些 fd 只能在这里关闭。
+        leftover_conns.swap(completed_);
     }
     for (auto& t : leftover) {
         t.ssl.reset();  // 先释放会话再关 fd（SSL_free 不做 I/O，顺序只是防日后改动踩坑）
@@ -347,7 +339,7 @@ void HttpServer::Stop() {
         ::close(r.fd);
     }
 
-    // wake_fd_ 必须等到工作线程全部退出后才关闭：recycle_conn 在工作线程里写它，
+    // wake_fd_ 必须等到工作线程全部退出后才关闭：queue_completed 在工作线程里写它，
     // 若在 cleanup() 里提前 close，worker 可能写出一个「已经被系统回收、又被别人占用」
     // 的 fd 号——那不是 fp 泄漏级别的问题，是往别人的连接里写脏数据。
     if (wake_fd_ >= 0) {
@@ -378,7 +370,7 @@ void HttpServer::run() {
                 std::uint64_t drained = 0;
                 while (::read(wake_fd_, &drained, sizeof(drained)) > 0) {
                 }
-                drain_recycled();
+                drain_completed();
                 continue;
             }
 
@@ -470,14 +462,20 @@ void HttpServer::run() {
                     }
                 }
             } else if (ev & (EPOLLIN | EPOLLOUT)) {
-                // 必须先处理 EPOLLIN 再处理 HUP/ERR：
+                // 必须先处理可读/可写再处理 HUP/ERR：
                 // 「发完请求立刻 close」的客户端会同时带回 EPOLLIN|EPOLLHUP，
                 // 若先走 HUP 分支直接关连接，缓冲区里那条完整请求就被丢掉了。
                 //
-                // EPOLLOUT 只在 TLS 握手期间被关注（handshake 需要回写时）。
-                // 它是水平触发的：一旦注册且 socket 可写，每次 epoll_wait 都会立刻返回，
-                // 所以 drive_handshake 必须在每次推进后重新收敛关注事件，
-                // 否则这里会变成 100% CPU 空转——和 EMFILE 那个自旋是同一类 bug。
+                // 这里不按事件位分流，一律走 handle_read：同一条连接在不同阶段
+                // 关注的事件本来就不同——收请求是 EPOLLIN，写回是 EPOLLOUT，
+                // TLS 握手可能是 EPOLLIN|EPOLLOUT。按事件位分的话，
+                // 「握手需要回写」会被误送进写回逻辑，握手就永远推不完。
+                // 真正的分流在 handle_read 入口按连接状态做。
+                //
+                // EPOLLOUT 是水平触发的：一旦注册且 socket 可写，每次 epoll_wait
+                // 都会立刻返回，所以 flush_conn / drive_handshake 每次推进后都必须
+                // 重新收敛关注事件，否则这里会变成 100% CPU 空转——
+                // 和 EMFILE 那个自旋是同一类 bug。
                 handle_read(fd);
             } else if (ev & (EPOLLHUP | EPOLLERR)) {
                 close_conn(fd);
@@ -485,7 +483,7 @@ void HttpServer::run() {
         }
 
         // 兜底：即使 eventfd 不可用、或唤醒事件排在下一批，也不会让交还的连接一直卡着。
-        drain_recycled();
+        drain_completed();
 
         // 活跃连接数由事件循环线程独占计算。读侧只能读这个原子量，
         // 绝不能去访问 conns_ —— 那张表没有锁，是事件循环线程的私有状态。
@@ -507,6 +505,16 @@ void HttpServer::handle_read(int fd) {
     if (it == conns_.end()) {
         return;  // 已移交给工作线程，忽略同批残留事件
     }
+
+    // 写回阶段不能读：此时这条连接上还有一条请求没有收尾，再解析出一条就会让它
+    // 同时处理两条请求（响应交错、连接被两个任务先后关闭）。
+    // 正常路径下写回阶段只注册 EPOLLOUT，压根进不到这里；这道闸是给
+    // 「以后有人给写回阶段多注册一个事件位」准备的，成本是一条判断。
+    if (it->second.writing) {
+        flush_conn(fd);
+        return;
+    }
+
     it->second.last_active = std::chrono::steady_clock::now();
 
     // TLS 握手期间没有应用层字节可读，先把握手推完。
@@ -637,44 +645,35 @@ void HttpServer::handle_request(int fd, HttpRequest req, std::unique_ptr<tls::Se
         responses_2xx_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    const bool keep_alive  = !pipelined && wants_keep_alive(req);
-    const std::string data = build_response(resp, keep_alive);
+    const bool keep_alive = !pipelined && wants_keep_alive(req);
 
-    // 阻塞写 + 发送超时：慢客户端最多占用 worker kSendTimeoutMs，之后放弃。
-    // TLS 的记录层同样受这个超时约束（SSL_write 底下就是 send）。
-    set_nonblocking(fd, false);
-    set_send_timeout(fd, kSendTimeoutMs);
-    const bool wrote = ssl ? ssl->WriteAll(data.data(), data.size()) : write_all(fd, data);
+    // 不能是 const：const 的 std::string 上 std::move 只会退化成拷贝，
+    // 一条 8MB 的响应会白白多复制一次（performance-move-const-arg 也会拦下来）。
+    std::string data = build_response(resp, keep_alive);
 
-    // 只有「客户端明确要求复用」且「响应完整写出」才把连接交还事件循环。
-    // 写失败说明对端已关闭或写超时，复用毫无意义；关停过程中也不再挂回 epoll。
+    // 到这里为止一次 socket 写都没做过。整条响应交给事件循环去写，
+    // 工作线程立刻回去取下一个任务——这是「慢客户端独占 worker」的修法本身。
     //
-    // 注意 TLS 的特殊性：WriteAll 失败时可能只写出半个记录，会话已经不可恢复，
-    // 绝不能把这条连接塞回池子——那会让下一个请求读到错位的字节流。
-    if (keep_alive && wrote && !stop_) {
-        recycle_conn(fd, std::move(ssl), req.remote_ip);
-        return;
-    }
-
-    // 先释放会话再关 fd。SSL_free 本身不做 I/O（socket BIO 是 BIO_NOCLOSE 的），
-    // 但顺序写死在这里，免得以后有人往析构里加 SSL_shutdown 时踩到已关闭的 fd。
-    ssl.reset();
-    ::close(fd);
+    // 以前这里是 set_nonblocking(fd, false) + SO_SNDTIMEO + 阻塞写：
+    // 对端不读时 send() 会把 worker 按住整整 kSendTimeoutMs，四个这样的
+    // 客户端就能让 worker_count=4 的节点对所有人失去响应。
+    Completed done;
+    done.fd         = fd;
+    done.ssl        = std::move(ssl);
+    done.remote_ip  = std::move(req.remote_ip);
+    done.data       = std::move(data);
+    done.keep_alive = keep_alive;
+    queue_completed(std::move(done));
 }
 
-void HttpServer::recycle_conn(int fd, std::unique_ptr<tls::Session> ssl,
-                              const std::string& remote_ip) {
-    // 工作线程为了阻塞写把 fd 设成了阻塞模式，交还前必须还原：
-    // 事件循环里的 recv 是非阻塞假设的，一个阻塞 fd 会把整个事件循环卡死。
-    set_nonblocking(fd, true);
-
+void HttpServer::queue_completed(Completed item) {
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
-        recycled_.push_back(Recycled{fd, std::move(ssl), remote_ip});
+        completed_.push_back(std::move(item));
     }
 
-    // 立刻唤醒 epoll。不唤醒的话，这根连接要等 epoll_wait 的 100ms 超时才被重新注册，
-    // 复用连接省下的握手时间会被这 100ms 全部吃掉——那就白做了。
+    // 立刻唤醒 epoll。不唤醒的话，这条响应要等 epoll_wait 的 100ms 超时才被写出去，
+    // keep-alive 连接省下的握手时间会被这 100ms 全部吃掉——那就白做了。
     if (wake_fd_ >= 0) {
         const std::uint64_t one = 1;
         // EAGAIN 说明计数器已满，即已经处于「待唤醒」状态，无需再处理。
@@ -683,40 +682,134 @@ void HttpServer::recycle_conn(int fd, std::unique_ptr<tls::Session> ssl,
     }
 }
 
-void HttpServer::drain_recycled() {
-    std::deque<Recycled> pending;
+void HttpServer::drain_completed() {
+    std::deque<Completed> pending;
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
-        if (recycled_.empty()) {
+        if (completed_.empty()) {
             return;
         }
-        pending.swap(recycled_);
+        pending.swap(completed_);
     }
 
     const auto now = std::chrono::steady_clock::now();
     for (auto& r : pending) {
         // 已进入关停流程或连接数已达上限：不再挂回 epoll，直接关闭。
+        // 先释放会话再关 fd，与其它关闭路径保持一致。
         if (stop_ || conns_.size() >= kMaxConns) {
+            r.ssl.reset();
             ::close(r.fd);
             continue;
         }
 
+        // 先按「等可写」注册：这条连接一出场就是写回阶段。
+        // 绝大多数响应一次就写完，flush_conn 会立刻把它改回 EPOLLIN；
+        // 写不完的才真的留在这里等 EPOLLOUT。
         struct epoll_event cev;
         std::memset(&cev, 0, sizeof(cev));
-        cev.events  = EPOLLIN;
+        cev.events  = EPOLLOUT;
         cev.data.fd = r.fd;
         if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, r.fd, &cev) != 0) {
+            r.ssl.reset();
             ::close(r.fd);
             continue;
         }
 
         Conn conn;
-        conn.remote_ip   = std::move(r.remote_ip);
-        conn.ssl         = std::move(r.ssl);  // 会话跟着 fd 回到事件循环
-        conn.handshaking = false;             // 能走到这里说明握手早就完成了
-        conn.last_active = now;
-        conns_[r.fd]     = std::move(conn);
+        conn.remote_ip        = std::move(r.remote_ip);
+        conn.ssl              = std::move(r.ssl);  // 会话跟着 fd 回到事件循环
+        conn.out              = std::move(r.data);
+        conn.out_off          = 0;
+        conn.writing          = true;
+        conn.keep_alive_after = r.keep_alive;
+        conn.handshaking      = false;  // 能走到这里说明握手早就完成了
+        conn.last_active      = now;
+        conn.write_deadline   = now + std::chrono::milliseconds(kSendTimeoutMs);
+        conns_[r.fd]          = std::move(conn);
+
+        flush_conn(r.fd);
     }
+}
+
+bool HttpServer::flush_conn(int fd) {
+    auto it = conns_.find(fd);
+    if (it == conns_.end()) {
+        return false;  // 同批事件里已经被关掉了
+    }
+
+    Conn& c = it->second;
+    if (!c.writing) {
+        return true;
+    }
+
+    std::size_t written = 0;
+    while (c.out_off < c.out.size()) {
+        const std::size_t left = c.out.size() - c.out_off;
+        long n                 = 0;
+
+        if (c.ssl) {
+            tls::Io io = tls::Io::kOk;
+            n          = c.ssl->Write(c.out.data() + c.out_off, left, io);
+            if (n <= 0) {
+                if (io == tls::Io::kWantWrite) {
+                    set_interest(fd, EPOLLOUT);
+                    return true;
+                }
+                // kWantRead：TLS 1.3 的 KeyUpdate 之类「写方向要先读」的情况。
+                // 我们没法在读之前推进这次写，而 EPOLLOUT 是水平触发的、socket
+                // 一直可写——继续重试就是 100% CPU 空转。直接关掉：
+                // 客户端看到这条响应被截断，代价明确且有限。
+                //
+                // kClosed / kFailed 同理：半个 TLS 记录已经出去了，会话不可恢复。
+                close_conn(fd);
+                return false;
+            }
+        } else {
+            const ssize_t r = ::send(fd, c.out.data() + c.out_off, left, MSG_NOSIGNAL);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    set_interest(fd, EPOLLOUT);
+                    return true;
+                }
+                close_conn(fd);
+                return false;
+            }
+            n = r;
+        }
+
+        c.out_off += static_cast<std::size_t>(n);
+        written += static_cast<std::size_t>(n);
+
+        // 有进展就续命：写得慢不该被掐，写不动才该。
+        c.write_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(kSendTimeoutMs);
+
+        // 让出的前提是「还没写完」：刚好写满上限并且正好写完时，
+        // 只多一次空转的 EPOLLOUT 才走到收尾，没必要。
+        if (written >= kMaxBytesPerFlush && c.out_off < c.out.size()) {
+            set_interest(fd, EPOLLOUT);  // 剩下的下一轮接着写
+            return true;
+        }
+    }
+
+    // 整条响应已经写出去了。
+    if (!c.keep_alive_after || stop_) {
+        close_conn(fd);
+        return false;
+    }
+
+    // 收回成「等下一个请求」。缓冲要真的还回去：一条 keep-alive 连接留着上一次
+    // 那个 8MB 的响应缓冲，是这种改法最容易长出来的内存泄漏。
+    std::string().swap(c.out);
+    c.out_off          = 0;
+    c.writing          = false;
+    c.keep_alive_after = false;
+    c.last_active      = std::chrono::steady_clock::now();
+    set_interest(fd, EPOLLIN);
+    return true;
 }
 
 void HttpServer::worker_loop() {
@@ -798,9 +891,20 @@ void HttpServer::sweep_idle() {
     // 先收集再关闭：erase 会让迭代器失效。
     std::vector<int> victims;
     for (const auto& kv : conns_) {
+        const Conn& c = kv.second;
+
+        // 写回阶段只看「写出有没有进展」，不看最后一次收数据的时刻：
+        // 一条正在给慢客户端吐大响应的连接，可能已经很长时间没收过数据了，
+        // 但它一直在往前推，不该被当成空闲连接掐掉。
+        if (c.writing) {
+            if (now >= c.write_deadline) {
+                victims.push_back(kv.first);
+            }
+            continue;
+        }
+
         const auto idle_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - kv.second.last_active)
-                .count();
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - c.last_active).count();
         if (idle_ms >= kIdleTimeoutMs) {
             victims.push_back(kv.first);
         }
@@ -826,12 +930,13 @@ void HttpServer::cleanup() {
 
     // 事件循环退出后，仍可能有工作线程交还但未被 drain 的连接。
     {
-        std::deque<Recycled> pending;
+        std::deque<Completed> pending;
         {
             std::lock_guard<std::mutex> lk(queue_mtx_);
-            pending.swap(recycled_);
+            pending.swap(completed_);
         }
         for (auto& r : pending) {
+            r.ssl.reset();
             ::close(r.fd);
         }
     }

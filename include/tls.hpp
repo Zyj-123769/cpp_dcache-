@@ -89,6 +89,12 @@ public:
     // 读：返回 >0 为字节数；==0 见 io（kClosed）；<0 见 io（kWantRead/kWantWrite/kFailed）。
     long Read(void* buf, std::size_t len, Io& io);
 
+    // 非阻塞写：返回 >0 为本次写出的字节数；<0 时看 io——
+    // kWantWrite/kWantRead 表示「现在写不动，等 socket 可写/可读后原样重试」，
+    // kClosed/kFailed 表示这条会话已经不可恢复。
+    // 与 WriteAll 的唯一区别是「不替你等」，调用方自己注册 EPOLLOUT。
+    long Write(const void* data, std::size_t len, Io& io);
+
     // 阻塞语义的整段写：调用方负责把 fd 设为阻塞并设好 SO_SNDTIMEO。
     // 超时或对端断开一律返回 false —— 此时 TLS 记录可能只写了一半，
     // 这条会话已经不可恢复，调用方必须关闭连接而不是重试。
