@@ -42,13 +42,13 @@ GetResult counting_getter(const std::string& key) {
 // 用来验证错误结果不会被写进负缓存。
 class FlakyPicker : public PeerPicker {
 public:
-    mutable int  calls = 0;
-    mutable bool fail  = true;
+    mutable int calls = 0;
+    mutable bool fail = true;
 
     std::string PickPeer(const std::string&) const override { return "10.0.0.1:1"; }
 
-    GetResult GetFromPeer(const std::string&, const std::string&,
-                          const std::string& key, int) const override {
+    GetResult GetFromPeer(const std::string&, const std::string&, const std::string& key,
+                          int) const override {
         ++calls;
         if (fail) {
             return GetResult::Error("simulated peer timeout");
@@ -60,8 +60,8 @@ public:
 // 原始 socket 客户端：构造 HttpClient 做不到的报文
 // （发完立刻关写端、声明超大 Content-Length 等）。
 // 返回 false 表示对端没给出任何响应（连接被断开）。
-bool raw_exchange(std::uint16_t port, const std::string& request,
-                  std::string& response, bool half_close) {
+bool raw_exchange(std::uint16_t port, const std::string& request, std::string& response,
+                  bool half_close) {
     response.clear();
 
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -89,7 +89,7 @@ bool raw_exchange(std::uint16_t port, const std::string& request,
         off += static_cast<std::size_t>(n);
     }
     if (half_close) {
-        ::shutdown(fd, SHUT_WR); // 模拟「发完请求立刻关写端」的客户端
+        ::shutdown(fd, SHUT_WR);  // 模拟「发完请求立刻关写端」的客户端
     }
 
     char tmp[4096];
@@ -104,7 +104,7 @@ bool raw_exchange(std::uint16_t port, const std::string& request,
     return !response.empty();
 }
 
-} // namespace
+}  // namespace
 
 // 可重复使用的原始连接：验证服务端 keep-alive 必须靠它。
 // HttpClient 是同步「一问一答」，永远看不到「同一连接上的第二条请求」。
@@ -175,7 +175,7 @@ public:
     }
 
 private:
-    int         fd_ = -1;
+    int fd_ = -1;
     std::string buf_;
 };
 
@@ -191,13 +191,13 @@ int main() {
 
         const GetResult r2 = g.Get("k");
         CHECK(r2.found());
-        CHECK(g_source_calls.load() == 1); // 二次访问本地命中，未再回源
+        CHECK(g_source_calls.load() == 1);  // 二次访问本地命中，未再回源
 
         const GetResult ra = g.Get("absent");
         CHECK(!ra.found());
         const int after_miss = g_source_calls.load();
         g.Get("absent");
-        CHECK(g_source_calls.load() == after_miss); // 空值已缓存，未再回源
+        CHECK(g_source_calls.load() == after_miss);  // 空值已缓存，未再回源
     }
 
     // H1 回归：极小 TTL（1/2/3ms）不应触发模零 UB（ttl_with_jitter 的 span==0 路径）。
@@ -205,7 +205,7 @@ int main() {
         for (std::uint64_t ttl : {std::uint64_t(1), std::uint64_t(2), std::uint64_t(3)}) {
             Group tiny("tiny", 10, counting_getter, ttl);
             const GetResult r = tiny.Get("h1-key");
-            CHECK(r.found()); // 不崩溃且正常返回
+            CHECK(r.found());  // 不崩溃且正常返回
         }
     }
 
@@ -222,15 +222,18 @@ int main() {
         Group g("g", 100, slow_getter);
         std::vector<std::thread> ts;
         std::atomic<int> got{0};
-        std::atomic<bool> start{false}; // 栅栏：确保所有线程几乎同时进入 Get
+        std::atomic<bool> start{false};  // 栅栏：确保所有线程几乎同时进入 Get
         for (int i = 0; i < 100; ++i) {
             ts.emplace_back([&]() {
-                while (!start.load()) std::this_thread::yield();
-                if (g.Get("hot").found()) got.fetch_add(1);
+                while (!start.load())
+                    std::this_thread::yield();
+                if (g.Get("hot").found())
+                    got.fetch_add(1);
             });
         }
         start = true;
-        for (auto& th : ts) th.join();
+        for (auto& th : ts)
+            th.join();
         CHECK(calls.load() == 1);
         CHECK(got.load() == 100);
     }
@@ -243,10 +246,12 @@ int main() {
 
         HttpServer sA, sB;
         CHECK(sA.Start("127.0.0.1", 0, [&nodeA](const HttpRequest& req, HttpResponse& resp) {
-            if (nodeA) nodeA->ServeHTTP(req, resp);
+            if (nodeA)
+                nodeA->ServeHTTP(req, resp);
         }));
         CHECK(sB.Start("127.0.0.1", 0, [&nodeB](const HttpRequest& req, HttpResponse& resp) {
-            if (nodeB) nodeB->ServeHTTP(req, resp);
+            if (nodeB)
+                nodeB->ServeHTTP(req, resp);
         }));
 
         const std::string a = "127.0.0.1:" + std::to_string(sA.Port());
@@ -268,17 +273,18 @@ int main() {
         std::string key;
         for (int i = 0;; ++i) {
             key = "key" + std::to_string(i);
-            if (ring.GetNode(key) == b) break;
+            if (ring.GetNode(key) == b)
+                break;
         }
 
         const GetResult r1 = nodeA->Get("g", key);
         CHECK(r1.found());
-        CHECK(nodeB->FindGroup("g")->stats().source_fetch == 1); // B 回源一次
-        CHECK(nodeA->FindGroup("g")->stats().remote_fetch == 1); // A 转发一次
+        CHECK(nodeB->FindGroup("g")->stats().source_fetch == 1);  // B 回源一次
+        CHECK(nodeA->FindGroup("g")->stats().remote_fetch == 1);  // A 转发一次
 
         const GetResult r2 = nodeA->Get("g", key);
         CHECK(r2.found());
-        CHECK(nodeA->FindGroup("g")->stats().remote_fetch == 1); // 二次本地命中，未再转发
+        CHECK(nodeA->FindGroup("g")->stats().remote_fetch == 1);  // 二次本地命中，未再转发
         CHECK(nodeA->FindGroup("g")->stats().local_hit >= 1);
 
         sA.Stop();
@@ -288,11 +294,9 @@ int main() {
     // D. P0-1 回归：handler 抛异常必须变成 500，而不是让工作线程 terminate 掉进程。
     {
         HttpServer s;
-        CHECK(s.Start("127.0.0.1", 0,
-                      [](const HttpRequest&, HttpResponse&) {
-                          throw std::runtime_error("boom");
-                      },
-                      2));
+        CHECK(s.Start(
+            "127.0.0.1", 0,
+            [](const HttpRequest&, HttpResponse&) { throw std::runtime_error("boom"); }, 2));
 
         std::string body;
         // 5xx → HttpClient::Get 返回 false。能走到这一步本身就说明进程还活着。
@@ -313,7 +317,7 @@ int main() {
         CHECK(s.Start("127.0.0.1", 0, handler, 2));
         s.Stop();
 
-        CHECK(s.Start("127.0.0.1", 0, handler, 2));   // 重启
+        CHECK(s.Start("127.0.0.1", 0, handler, 2));  // 重启
         std::string body;
         CHECK(HttpClient::Get("127.0.0.1", s.Port(), "/ping", body, 2000));
         CHECK(body == "ok");
@@ -330,7 +334,7 @@ int main() {
         CHECK(ring.RingSize() == 300);
 
         ring.RemoveNode("127.0.0.1:8002");
-        CHECK(ring.RingSize() == 150);            // 只剩 A 的 150 个，一个不少
+        CHECK(ring.RingSize() == 150);  // 只剩 A 的 150 个，一个不少
         CHECK(ring.Contains("127.0.0.1:8001"));
         CHECK(!ring.Contains("127.0.0.1:8002"));
     }
@@ -349,9 +353,9 @@ int main() {
 
         const GetResult r2 = g.Get("k");
         CHECK(r2.is_error());
-        CHECK(picker->calls == 2); // 错误没进缓存，必须重新去问对端
+        CHECK(picker->calls == 2);  // 错误没进缓存，必须重新去问对端
 
-        picker->fail = false;
+        picker->fail       = false;
         const GetResult r3 = g.Get("k");
         CHECK(r3.ok());
         CHECK(r3.value == "v:k");
@@ -361,16 +365,15 @@ int main() {
     // H. 错误响应体：节点对 kError 返回 503 且带 error 字段，而不是 200+found=false。
     {
         HttpServer s;
-        Node       node("127.0.0.1:1", 150);
-        node.AddGroup("g", 10, [](const std::string&) {
-            return GetResult::Error("source is down");
-        });
+        Node node("127.0.0.1:1", 150);
+        node.AddGroup("g", 10,
+                      [](const std::string&) { return GetResult::Error("source is down"); });
         CHECK(s.Start("127.0.0.1", 0, [&node](const HttpRequest& req, HttpResponse& resp) {
             node.ServeHTTP(req, resp);
         }));
 
         std::string body;
-        int         status = 0;
+        int status = 0;
         CHECK(!HttpClient::Get("127.0.0.1", s.Port(), "/api/g/k", body, 2000, {}, &status));
         CHECK(status == 503);
         s.Stop();
@@ -381,10 +384,13 @@ int main() {
     //    缓冲区里那条完整请求被丢掉，客户端只看到连接被重置。
     {
         HttpServer s;
-        CHECK(s.Start("127.0.0.1", 0, [](const HttpRequest&, HttpResponse& resp) {
-            resp.status = 200;
-            resp.body   = "ok";
-        }, 2));
+        CHECK(s.Start(
+            "127.0.0.1", 0,
+            [](const HttpRequest&, HttpResponse& resp) {
+                resp.status = 200;
+                resp.body   = "ok";
+            },
+            2));
 
         std::string resp;
         CHECK(raw_exchange(s.Port(), "GET /x HTTP/1.1\r\nHost: a\r\n\r\n", resp, true));
@@ -397,16 +403,19 @@ int main() {
     //    读缓冲在 64KB 封顶，这种请求永远「收不全」，旧实现会让连接一直占着位置。
     {
         HttpServer s;
-        CHECK(s.Start("127.0.0.1", 0, [](const HttpRequest&, HttpResponse& resp) {
-            resp.status = 200;
-            resp.body   = "should not happen";
-        }, 2));
+        CHECK(s.Start(
+            "127.0.0.1", 0,
+            [](const HttpRequest&, HttpResponse& resp) {
+                resp.status = 200;
+                resp.body   = "should not happen";
+            },
+            2));
 
         std::string resp;
         CHECK(!raw_exchange(s.Port(),
                             "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 100000000\r\n\r\n",
                             resp, true));
-        CHECK(resp.empty()); // 没有任何响应体 = 服务端直接断开
+        CHECK(resp.empty());  // 没有任何响应体 = 服务端直接断开
         s.Stop();
     }
 
@@ -415,14 +424,15 @@ int main() {
     //    这里第二条请求会直接读到 EOF。
     {
         std::atomic<int> served{0};
-        HttpServer       s;
-        CHECK(s.Start("127.0.0.1", 0,
-                      [&served](const HttpRequest&, HttpResponse& resp) {
-                          resp.status = 200;
-                          resp.body   = "ok";
-                          served.fetch_add(1);
-                      },
-                      2));
+        HttpServer s;
+        CHECK(s.Start(
+            "127.0.0.1", 0,
+            [&served](const HttpRequest&, HttpResponse& resp) {
+                resp.status = 200;
+                resp.body   = "ok";
+                served.fetch_add(1);
+            },
+            2));
 
         RawConn c;
         CHECK(c.Open(s.Port()));
@@ -468,7 +478,7 @@ int main() {
             HttpRequest m;
             m.method = "GET";
             m.path   = "/metrics";
-            HttpResponse      mr;
+            HttpResponse mr;
             node.ServeHTTP(m, mr);
             const std::string needle = "dcache_hops_rejected_total ";
             const std::size_t p      = mr.body.find(needle);
@@ -479,13 +489,13 @@ int main() {
         };
 
         CHECK(rejected() == 0);
-        CHECK(request("wrong").status == 200); // 请求本身仍正常受理，只是不信那个头
+        CHECK(request("wrong").status == 200);  // 请求本身仍正常受理，只是不信那个头
         CHECK(rejected() == 1);
 
-        request(nullptr); // 连 token 都不带
+        request(nullptr);  // 连 token 都不带
         CHECK(rejected() == 2);
 
-        request("s3cret"); // 正确 token
+        request("s3cret");  // 正确 token
         CHECK(rejected() == 2);
     }
 
@@ -493,8 +503,8 @@ int main() {
     {
         Node node("127.0.0.1:1", 150);
         node.AddGroup("scores", 10, counting_getter);
-        node.Get("scores", "k1"); // 未命中 + 回源
-        node.Get("scores", "k1"); // 命中
+        node.Get("scores", "k1");  // 未命中 + 回源
+        node.Get("scores", "k1");  // 命中
 
         HttpRequest m;
         m.method = "GET";
@@ -526,12 +536,13 @@ int main() {
     // O. 客户端连接复用：连续两次转发后池中应留有空闲连接；关掉开关后不再入池。
     {
         HttpServer s;
-        CHECK(s.Start("127.0.0.1", 0,
-                      [](const HttpRequest&, HttpResponse& resp) {
-                          resp.status = 200;
-                          resp.body   = "ok";
-                      },
-                      2));
+        CHECK(s.Start(
+            "127.0.0.1", 0,
+            [](const HttpRequest&, HttpResponse& resp) {
+                resp.status = 200;
+                resp.body   = "ok";
+            },
+            2));
 
         HttpClient::CloseIdleConnections();
         std::string body;

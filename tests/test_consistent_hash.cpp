@@ -45,8 +45,8 @@ int main() {
         }
     }
     const double ratio = static_cast<double>(moved) / total;
-    CHECK(ratio > 0.0);                    // D 确实接管了一部分 key
-    CHECK(ratio <= 2.0 / 3 + 0.05);        // 远小于普通取模哈希的 ~3/4 全量迁移
+    CHECK(ratio > 0.0);              // D 确实接管了一部分 key
+    CHECK(ratio <= 2.0 / 3 + 0.05);  // 远小于普通取模哈希的 ~3/4 全量迁移
 
     // 删除节点后不再返回该节点。
     ch.RemoveNode("D");

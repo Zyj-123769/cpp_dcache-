@@ -15,4 +15,4 @@ inline uint32_t murmur3_32(const std::string& s, uint32_t seed = 0) {
     return murmur3_32(s.data(), s.size(), seed);
 }
 
-} // namespace dcache
+}  // namespace dcache

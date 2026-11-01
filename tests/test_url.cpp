@@ -8,8 +8,7 @@ using namespace dcache;
 int main() {
     // 编码 / 解码往返一致（含空格、斜杠、查询符、非 ASCII）。
     const std::string samples[] = {
-        "hello", "a/b", "a b", "a?b=c", "key#1", "a%20b", "\xe4\xb8\xad\xe6\x96\x87"
-    };
+        "hello", "a/b", "a b", "a?b=c", "key#1", "a%20b", "\xe4\xb8\xad\xe6\x96\x87"};
     for (const auto& s : samples) {
         CHECK(UrlDecodeComponent(UrlEncodeComponent(s)) == s);
     }

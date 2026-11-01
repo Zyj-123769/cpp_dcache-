@@ -10,7 +10,7 @@ std::string vnode_key(const std::string& node, int i) {
     return node + "#" + std::to_string(i);
 }
 
-} // namespace
+}  // namespace
 
 ConsistentHash::ConsistentHash(int virtual_nodes) : virtual_nodes_(virtual_nodes) {
     if (virtual_nodes_ < 1) {
@@ -27,7 +27,7 @@ void ConsistentHash::AddNode(const std::string& node) {
         return;
     }
     if (vnodes_.find(node) != vnodes_.end()) {
-        return; // 已存在，幂等
+        return;  // 已存在，幂等
     }
 
     std::vector<std::uint32_t> hashes;
@@ -67,9 +67,9 @@ std::string ConsistentHash::GetNode(const std::string& key) const {
     }
 
     std::uint32_t h = hash(key);
-    auto it = ring_.lower_bound(h); // 顺时针：第一个 >= h 的虚拟节点
+    auto it         = ring_.lower_bound(h);  // 顺时针：第一个 >= h 的虚拟节点
     if (it == ring_.end()) {
-        it = ring_.begin();         // 越过环尾，回绕到 0
+        it = ring_.begin();  // 越过环尾，回绕到 0
     }
     return it->second;
 }
@@ -78,8 +78,14 @@ bool ConsistentHash::Contains(const std::string& node) const {
     return vnodes_.find(node) != vnodes_.end();
 }
 
-std::size_t ConsistentHash::NodeCount() const { return vnodes_.size(); }
-std::size_t ConsistentHash::RingSize() const { return ring_.size(); }
-int         ConsistentHash::VirtualNodes() const { return virtual_nodes_; }
+std::size_t ConsistentHash::NodeCount() const {
+    return vnodes_.size();
+}
+std::size_t ConsistentHash::RingSize() const {
+    return ring_.size();
+}
+int ConsistentHash::VirtualNodes() const {
+    return virtual_nodes_;
+}
 
-} // namespace dcache
+}  // namespace dcache

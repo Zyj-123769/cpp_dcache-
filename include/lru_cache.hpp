@@ -31,10 +31,10 @@ public:
     };
 
     struct Node {
-        key_type                              key;
-        value_type                            value;
+        key_type key;
+        value_type value;
         std::chrono::steady_clock::time_point expire_at;
-        bool                                  has_ttl = false;
+        bool has_ttl = false;
     };
 
     using list_type = std::list<Node>;
@@ -72,14 +72,14 @@ private:
     void evict_lru();
     bool expired(const Node& n, std::chrono::steady_clock::time_point now) const;
 
-    size_type           capacity_;
-    mutable std::mutex  mtx_;
-    list_type           order_;
-    map_type            index_;
-    Stats               stats_;
+    size_type capacity_;
+    mutable std::mutex mtx_;
+    list_type order_;
+    map_type index_;
+    Stats stats_;
 };
 
-} // namespace dcache
+}  // namespace dcache
 
 // 模板实现必须对实例化点可见，故在声明末尾包含实现片段。
 #include "../src/lru_cache.tpp"

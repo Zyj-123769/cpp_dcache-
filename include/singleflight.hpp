@@ -17,8 +17,8 @@ namespace dcache {
 template <typename R>
 class SingleFlight {
 public:
-    SingleFlight() = default;
-    SingleFlight(const SingleFlight&) = delete;
+    SingleFlight()                               = default;
+    SingleFlight(const SingleFlight&)            = delete;
     SingleFlight& operator=(const SingleFlight&) = delete;
 
     // 同一 key 并发调用只有一个真正执行 fn；其余等待并返回共享结果。
@@ -34,16 +34,16 @@ public:
             if (it != calls_.end()) {
                 call = it->second;
             } else {
-                call = std::make_shared<Call>();
+                call        = std::make_shared<Call>();
                 calls_[key] = call;
-                leader = true;
+                leader      = true;
             }
         }
 
         if (leader) {
             std::exception_ptr error;
             try {
-                call->value = fn();   // 真正的回源只会在这里执行一次
+                call->value = fn();  // 真正的回源只会在这里执行一次
             } catch (...) {
                 error = std::current_exception();
             }
@@ -60,14 +60,14 @@ public:
             }
 
             if (error) {
-                std::rethrow_exception(error); // leader 自身抛出异常
+                std::rethrow_exception(error);  // leader 自身抛出异常
             }
             return call->value;
         } else {
             std::unique_lock<std::mutex> lk(call->mtx);
             call->cv.wait(lk, [&] { return call->done; });
             if (call->error) {
-                std::rethrow_exception(call->error); // 等待者共享异常而非死锁
+                std::rethrow_exception(call->error);  // 等待者共享异常而非死锁
             }
             return call->value;
         }
@@ -81,15 +81,15 @@ public:
 
 private:
     struct Call {
-        std::mutex              mtx;
+        std::mutex mtx;
         std::condition_variable cv;
-        bool                    done  = false;
-        R                       value;
-        std::exception_ptr      error;
+        bool done = false;
+        R value;
+        std::exception_ptr error;
     };
 
-    mutable std::mutex                               mtx_;
+    mutable std::mutex mtx_;
     std::unordered_map<std::string, std::shared_ptr<Call>> calls_;
 };
 
-} // namespace dcache
+}  // namespace dcache

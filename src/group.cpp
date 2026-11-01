@@ -5,8 +5,8 @@
 
 namespace dcache {
 
-Group::Group(std::string name, std::size_t capacity, Getter getter,
-             std::uint64_t default_ttl_ms, std::uint64_t penetration_ttl_ms)
+Group::Group(std::string name, std::size_t capacity, Getter getter, std::uint64_t default_ttl_ms,
+             std::uint64_t penetration_ttl_ms)
     : name_(std::move(name)),
       getter_(std::move(getter)),
       default_ttl_ms_(default_ttl_ms),
@@ -92,13 +92,13 @@ std::uint64_t Group::ttl_with_jitter(std::uint64_t base_ms, const std::string& k
         return 0;
     }
     // 过期时间加随机抖动（±25%），破坏大量 key 同时过期的雪崩场景。
-    const std::uint64_t span = (base_ms / 4) * 2; // 抖动区间宽度 = base/2
+    const std::uint64_t span = (base_ms / 4) * 2;  // 抖动区间宽度 = base/2
     if (span == 0) {
-        return base_ms; // 极小 TTL 无法抖动，直接返回，避免模零 UB
+        return base_ms;  // 极小 TTL 无法抖动，直接返回，避免模零 UB
     }
     const std::uint32_t h = murmur3_32(key);
-    const std::int64_t delta = static_cast<std::int64_t>(h % span) -
-                               static_cast<std::int64_t>(span / 2);
+    const std::int64_t delta =
+        static_cast<std::int64_t>(h % span) - static_cast<std::int64_t>(span / 2);
     std::int64_t ttl = static_cast<std::int64_t>(base_ms) + delta;
     if (ttl < 1) {
         ttl = 1;
@@ -116,4 +116,4 @@ Group::Stats Group::stats() const {
     return s;
 }
 
-} // namespace dcache
+}  // namespace dcache

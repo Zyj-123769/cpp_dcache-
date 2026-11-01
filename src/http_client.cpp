@@ -12,8 +12,8 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -68,7 +68,7 @@ int connect_timeout(const std::string& host, std::uint16_t port, int timeout_ms)
     pfd.events = POLLOUT;
     int prc    = ::poll(&pfd, 1, timeout_ms);
 
-    int so_error = 0;
+    int so_error   = 0;
     socklen_t slen = sizeof(so_error);
     ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen);
 
@@ -79,7 +79,7 @@ int connect_timeout(const std::string& host, std::uint16_t port, int timeout_ms)
         return -1;
     }
 
-    ::fcntl(fd, F_SETFL, flags); // 恢复阻塞
+    ::fcntl(fd, F_SETFL, flags);  // 恢复阻塞
     set_timeout(fd, timeout_ms, SO_RCVTIMEO);
     set_timeout(fd, timeout_ms, SO_SNDTIMEO);
     return fd;
@@ -90,7 +90,8 @@ bool send_all(int fd, const char* data, std::size_t len) {
     while (off < len) {
         ssize_t n = ::send(fd, data + off, len - off, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return false;
         }
         off += static_cast<std::size_t>(n);
@@ -111,18 +112,22 @@ bool read_headers(int fd, std::string& buf, std::size_t& header_end, bool& peer_
             return true;
         }
         if (buf.size() > kMaxHeaderBytes) {
-            return false; // 响应头超限：对端可能根本不打算结束头部
+            return false;  // 响应头超限：对端可能根本不打算结束头部
         }
         ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
         if (n == 0) {
             // 连接被关闭但可能已经收到完整头。
             std::size_t pos2 = buf.find("\r\n\r\n");
-            if (pos2 != std::string::npos) { header_end = pos2 + 4; return true; }
+            if (pos2 != std::string::npos) {
+                header_end = pos2 + 4;
+                return true;
+            }
             peer_closed = buf.empty();
             return false;
         }
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             return false;
         }
         buf.append(tmp, static_cast<std::size_t>(n));
@@ -138,18 +143,21 @@ int parse_response(const std::string& header_block, long& content_length) {
 
     // "HTTP/1.1 200 OK"
     const std::size_t sp1 = reqline.find(' ');
-    if (sp1 == std::string::npos) return -1;
-    const std::size_t sp2 = reqline.find(' ', sp1 + 1);
+    if (sp1 == std::string::npos)
+        return -1;
+    const std::size_t sp2        = reqline.find(' ', sp1 + 1);
     const std::string status_str = reqline.substr(sp1 + 1, sp2 - sp1 - 1);
-    const int status = std::atoi(status_str.c_str());
-    if (status <= 0) return -1;
+    const int status             = std::atoi(status_str.c_str());
+    if (status <= 0)
+        return -1;
 
     // 大小写不敏感地找 Content-Length:（本项目服务器固定发送该头）。
     auto case_find = [&](const std::string& block, const char* needle) -> std::size_t {
         std::string lower(block.size(), '\0');
         for (std::size_t i = 0; i < block.size(); ++i) {
             char c = block[i];
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
             lower[i] = c;
         }
         return lower.find(needle);
@@ -157,7 +165,7 @@ int parse_response(const std::string& header_block, long& content_length) {
 
     const std::size_t clp = case_find(header_block, "content-length:");
     if (clp != std::string::npos) {
-        const char* p = header_block.c_str() + clp + 15; // strlen("content-length:") == 15
+        const char* p  = header_block.c_str() + clp + 15;  // strlen("content-length:") == 15
         content_length = std::strtol(p, nullptr, 10);
     }
     return status;
@@ -165,7 +173,8 @@ int parse_response(const std::string& header_block, long& content_length) {
 
 std::string to_lower(std::string s) {
     for (char& c : s) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
     }
     return s;
 }
@@ -189,14 +198,14 @@ constexpr int kIdleTtlMs = 5000;
 std::atomic<bool> g_keep_alive{true};
 
 struct IdleConn {
-    int                                   fd = -1;
+    int fd = -1;
     std::chrono::steady_clock::time_point since;
 };
 
 class ConnectionPool {
 public:
     static ConnectionPool& Instance() {
-        static ConnectionPool pool; // C++11 起函数内静态保证线程安全初始化
+        static ConnectionPool pool;  // C++11 起函数内静态保证线程安全初始化
         return pool;
     }
 
@@ -209,8 +218,8 @@ public:
         }
 
         std::vector<IdleConn>& list = it->second;
-        const auto now = std::chrono::steady_clock::now();
-        int fd = -1;
+        const auto now              = std::chrono::steady_clock::now();
+        int fd                      = -1;
         while (!list.empty()) {
             const IdleConn c = list.back();
             list.pop_back();
@@ -219,7 +228,7 @@ public:
                 fd = c.fd;
                 break;
             }
-            ::close(c.fd); // 超时未用：服务端多半已回收，不能拿来当活连接
+            ::close(c.fd);  // 超时未用：服务端多半已回收，不能拿来当活连接
         }
         if (list.empty()) {
             idle_.erase(it);
@@ -271,7 +280,7 @@ private:
         const auto now = std::chrono::steady_clock::now();
         for (auto it = idle_.begin(); it != idle_.end();) {
             std::vector<IdleConn>& list = it->second;
-            std::size_t kept = 0;
+            std::size_t kept            = 0;
             for (std::size_t i = 0; i < list.size(); ++i) {
                 if (IdleAgeMs(now, list[i].since) < kIdleTtlMs) {
                     list[kept++] = list[i];
@@ -289,15 +298,15 @@ private:
         }
     }
 
-    mutable std::mutex                                     mtx_;
+    mutable std::mutex mtx_;
     std::unordered_map<std::string, std::vector<IdleConn>> idle_;
-    std::size_t                                            total_ = 0;
+    std::size_t total_ = 0;
 };
 
 enum class ExchangeResult {
-    kOk,        // 完整响应，out 有效
-    kStaleConn, // 一个字节都没收到、对端就关了：多半是复用的旧连接已被回收
-    kFailed     // 超时、写失败、报文损坏或非 200
+    kOk,         // 完整响应，out 有效
+    kStaleConn,  // 一个字节都没收到、对端就关了：多半是复用的旧连接已被回收
+    kFailed      // 超时、写失败、报文损坏或非 200
 };
 
 // 在一条已建立的连接上完成一次「请求 - 响应」。
@@ -322,7 +331,7 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
 
     std::string buf;
     std::size_t header_end = 0;
-    bool        peer_closed = false;
+    bool peer_closed       = false;
     if (!read_headers(fd, buf, header_end, peer_closed)) {
         return peer_closed ? ExchangeResult::kStaleConn : ExchangeResult::kFailed;
     }
@@ -362,9 +371,11 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
         char tmp[4096];
         while (body.size() < want) {
             ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n == 0) break;
+            if (n == 0)
+                break;
             if (n < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR)
+                    continue;
                 break;
             }
             body.append(tmp, static_cast<std::size_t>(n));
@@ -390,9 +401,11 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
         char tmp[4096];
         for (;;) {
             ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n == 0) break;
+            if (n == 0)
+                break;
             if (n < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR)
+                    continue;
                 break;
             }
             body.append(tmp, static_cast<std::size_t>(n));
@@ -409,23 +422,22 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
     return ExchangeResult::kOk;
 }
 
-} // namespace
+}  // namespace
 
-bool HttpClient::Get(const std::string& host, std::uint16_t port,
-                     const std::string& path, std::string& out, int timeout_ms,
-                     const std::map<std::string, std::string>& extra_headers,
-                     int* http_status) {
+bool HttpClient::Get(const std::string& host, std::uint16_t port, const std::string& path,
+                     std::string& out, int timeout_ms,
+                     const std::map<std::string, std::string>& extra_headers, int* http_status) {
     if (http_status != nullptr) {
-        *http_status = 0; // 默认：连状态行都没读到
+        *http_status = 0;  // 默认：连状态行都没读到
     }
 
-    const std::string key         = host + ":" + std::to_string(port);
-    const bool        allow_reuse = g_keep_alive.load(std::memory_order_relaxed);
+    const std::string key  = host + ":" + std::to_string(port);
+    const bool allow_reuse = g_keep_alive.load(std::memory_order_relaxed);
 
     // 最多两轮：第二轮只会发生在「复用的旧连接已经失效」时。
     for (int attempt = 0; attempt < 2; ++attempt) {
         bool reused = false;
-        int  fd     = -1;
+        int fd      = -1;
 
         if (allow_reuse) {
             fd     = ConnectionPool::Instance().Take(key);
@@ -439,11 +451,11 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port,
             return false;
         }
 
-        int         status     = 0;
+        int status = 0;
         std::string body;
-        bool        keep_alive = false;
-        const ExchangeResult r = do_exchange(fd, host, port, path, timeout_ms, extra_headers,
-                                             &status, body, keep_alive);
+        bool keep_alive = false;
+        const ExchangeResult r =
+            do_exchange(fd, host, port, path, timeout_ms, extra_headers, &status, body, keep_alive);
 
         if (http_status != nullptr && status != 0) {
             *http_status = status;
@@ -484,4 +496,4 @@ void HttpClient::CloseIdleConnections() {
     ConnectionPool::Instance().Clear();
 }
 
-} // namespace dcache
+}  // namespace dcache

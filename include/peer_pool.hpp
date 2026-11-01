@@ -21,10 +21,8 @@ public:
     virtual std::string PickPeer(const std::string& key) const = 0;
 
     // 从指定节点地址（host:port）读取 group 下的 key。hops 为已转发跳数，随请求头传递用于防环。
-    virtual GetResult GetFromPeer(const std::string& peer,
-                                  const std::string& group,
-                                  const std::string& key,
-                                  int hops) const = 0;
+    virtual GetResult GetFromPeer(const std::string& peer, const std::string& group,
+                                  const std::string& key, int hops) const = 0;
 };
 
 // 基于一致性哈希 + HTTP 的节点选择 / 转发实现。
@@ -61,14 +59,12 @@ public:
     int VirtualNodes() const;
 
     std::string PickPeer(const std::string& key) const override;
-    GetResult   GetFromPeer(const std::string& peer, const std::string& group,
-                            const std::string& key, int hops) const override;
+    GetResult GetFromPeer(const std::string& peer, const std::string& group, const std::string& key,
+                          int hops) const override;
 
 private:
     // 取当前哈希环快照。
-    std::shared_ptr<const ConsistentHash> Snapshot() const {
-        return std::atomic_load(&ring_);
-    }
+    std::shared_ptr<const ConsistentHash> Snapshot() const { return std::atomic_load(&ring_); }
 
     std::string self_;
 
@@ -81,9 +77,9 @@ private:
     // peers 的 host 集合，独立于 ring_ 的锁（只保护自己的小集合，不与环重建产生锁序问题）。
     // auth_token_ 复用同一把锁：两者都只在「内部请求判定」这条路径上读，
     // 写只在启动时发生一次，争用可以忽略。
-    mutable std::mutex              peers_mtx_;
+    mutable std::mutex peers_mtx_;
     std::unordered_set<std::string> peer_hosts_;
-    std::string                     auth_token_;
+    std::string auth_token_;
 };
 
-} // namespace dcache
+}  // namespace dcache

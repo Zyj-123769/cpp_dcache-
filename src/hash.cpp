@@ -9,17 +9,15 @@ inline uint32_t rotl32(uint32_t x, int r) {
 }
 
 inline uint32_t read_le32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
-} // namespace
+}  // namespace
 
 uint32_t murmur3_32(const void* data, size_t len, uint32_t seed) {
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    const int nblocks = static_cast<int>(len / 4);
+    const int nblocks    = static_cast<int>(len / 4);
 
     uint32_t h1 = seed;
 
@@ -41,16 +39,20 @@ uint32_t murmur3_32(const void* data, size_t len, uint32_t seed) {
 
     // Tail：处理不足 4 字节的末尾。
     const uint8_t* tail = bytes + nblocks * 4;
-    uint32_t k1 = 0;
+    uint32_t k1         = 0;
     switch (len & 3) {
-        case 3: k1 ^= static_cast<uint32_t>(tail[2]) << 16; [[fallthrough]];
-        case 2: k1 ^= static_cast<uint32_t>(tail[1]) << 8;  [[fallthrough]];
-        case 1:
-            k1 ^= static_cast<uint32_t>(tail[0]);
-            k1 *= c1;
-            k1 = rotl32(k1, 15);
-            k1 *= c2;
-            h1 ^= k1;
+    case 3:
+        k1 ^= static_cast<uint32_t>(tail[2]) << 16;
+        [[fallthrough]];
+    case 2:
+        k1 ^= static_cast<uint32_t>(tail[1]) << 8;
+        [[fallthrough]];
+    case 1:
+        k1 ^= static_cast<uint32_t>(tail[0]);
+        k1 *= c1;
+        k1 = rotl32(k1, 15);
+        k1 *= c2;
+        h1 ^= k1;
     }
 
     // Finalization。
@@ -64,4 +66,4 @@ uint32_t murmur3_32(const void* data, size_t len, uint32_t seed) {
     return h1;
 }
 
-} // namespace dcache
+}  // namespace dcache

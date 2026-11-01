@@ -21,11 +21,10 @@ public:
     // http_status（可选出参）：拿到的 HTTP 状态码；0 表示根本没读到状态行
     // （连接失败/超时/报文损坏）。调用方据此区分「对端明确报错」与「够不着对端」，
     // 两者都不等于「数据不存在」。
-    static bool Get(const std::string& host, std::uint16_t port,
-                    const std::string& path, std::string& out,
-                    int timeout_ms = 2000,
+    static bool Get(const std::string& host, std::uint16_t port, const std::string& path,
+                    std::string& out, int timeout_ms = 2000,
                     const std::map<std::string, std::string>& extra_headers = {},
-                    int* http_status = nullptr);
+                    int* http_status                                        = nullptr);
 
     // 开关连接复用。关闭后退回「每请求一次 TCP」，行为与旧实现一致（排查问题时用）。
     static void SetKeepAlive(bool on);
@@ -37,4 +36,4 @@ public:
     static void CloseIdleConnections();
 };
 
-} // namespace dcache
+}  // namespace dcache

@@ -23,8 +23,8 @@ int main() {
 
     // 容量淘汰（LRU：淘汰最久未使用）
     c.put("b", "3", 0);
-    c.get("a");              // a 变为最近使用
-    c.put("c", "4", 0);      // 淘汰 b
+    c.get("a");          // a 变为最近使用
+    c.put("c", "4", 0);  // 淘汰 b
     CHECK(!c.get("b").has_value());
     CHECK(c.get("a").has_value());
     CHECK(c.get("c").has_value());
@@ -37,10 +37,10 @@ int main() {
 
     // TTL 惰性过期
     LruCache<std::string, int> t(2);
-    t.put("k", 42, 50);      // 50ms TTL
+    t.put("k", 42, 50);  // 50ms TTL
     CHECK(t.get("k").has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    CHECK(!t.get("k").has_value()); // 过期未命中且被惰性删除
+    CHECK(!t.get("k").has_value());  // 过期未命中且被惰性删除
     CHECK(t.size() == 0);
 
     // erase / contains
@@ -57,7 +57,8 @@ int main() {
     std::vector<std::thread> ts;
     for (int i = 0; i < 8; ++i) {
         ts.emplace_back([&]() {
-            while (!start.load()) std::this_thread::yield();
+            while (!start.load())
+                std::this_thread::yield();
             for (int j = 0; j < 10000; ++j) {
                 cc.put(j % 200, j, 0);
                 (void)cc.get(j % 200);
@@ -65,7 +66,8 @@ int main() {
         });
     }
     start = true;
-    for (auto& t : ts) t.join();
+    for (auto& t : ts)
+        t.join();
     CHECK(cc.size() <= 100);
 
     // 统计计数

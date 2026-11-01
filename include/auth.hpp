@@ -29,4 +29,4 @@ inline bool ConstantTimeEquals(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
-} // namespace dcache
+}  // namespace dcache

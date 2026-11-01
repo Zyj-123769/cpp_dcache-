@@ -15,7 +15,7 @@ void append_hex_escape(std::string& out, unsigned char c) {
 // 定位 "key" 字段，并让 pos 指向其值的起始位置（跳过冒号与空白）。
 bool find_after_key(const std::string& body, const std::string& key, std::size_t& p) {
     const std::string needle = "\"" + key + "\"";
-    std::size_t pos = body.find(needle);
+    std::size_t pos          = body.find(needle);
     if (pos == std::string::npos) {
         return false;
     }
@@ -35,9 +35,12 @@ bool find_after_key(const std::string& body, const std::string& key, std::size_t
 }
 
 int hex_digit(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
     return -1;
 }
 
@@ -60,26 +63,40 @@ void append_utf8(std::string& out, unsigned int code) {
     }
 }
 
-} // namespace
+}  // namespace
 
 std::string JsonEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
     for (unsigned char c : s) {
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            default:
-                if (c < 0x20) {
-                    append_hex_escape(out, c);
-                } else {
-                    out += static_cast<char>(c);
-                }
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        default:
+            if (c < 0x20) {
+                append_hex_escape(out, c);
+            } else {
+                out += static_cast<char>(c);
+            }
         }
     }
     return out;
@@ -96,38 +113,57 @@ std::string JsonUnescape(const std::string& s) {
         }
         char n = s[++i];
         switch (n) {
-            case '"':  out += '"';  break;
-            case '\\': out += '\\'; break;
-            case '/':  out += '/';  break;
-            case 'n':  out += '\n'; break;
-            case 'r':  out += '\r'; break;
-            case 't':  out += '\t'; break;
-            case 'b':  out += '\b'; break;
-            case 'f':  out += '\f'; break;
-            case 'u': {
-                if (i + 4 < s.size()) {
-                    int code = 0;
-                    bool ok = true;
-                    for (int k = 1; k <= 4; ++k) {
-                        int d = hex_digit(s[i + k]);
-                        if (d < 0) { ok = false; break; }
-                        code = code * 16 + d;
-                    }
-                    if (ok) {
-                        append_utf8(out, static_cast<unsigned int>(code));
-                        i += 4;
+        case '"':
+            out += '"';
+            break;
+        case '\\':
+            out += '\\';
+            break;
+        case '/':
+            out += '/';
+            break;
+        case 'n':
+            out += '\n';
+            break;
+        case 'r':
+            out += '\r';
+            break;
+        case 't':
+            out += '\t';
+            break;
+        case 'b':
+            out += '\b';
+            break;
+        case 'f':
+            out += '\f';
+            break;
+        case 'u': {
+            if (i + 4 < s.size()) {
+                int code = 0;
+                bool ok  = true;
+                for (int k = 1; k <= 4; ++k) {
+                    int d = hex_digit(s[i + k]);
+                    if (d < 0) {
+                        ok = false;
                         break;
                     }
+                    code = code * 16 + d;
                 }
-                out += '\\';
-                out += 'u';
-                break;
+                if (ok) {
+                    append_utf8(out, static_cast<unsigned int>(code));
+                    i += 4;
+                    break;
+                }
             }
-            default: {
-                out += '\\';
-                out += n;
-                break;
-            }
+            out += '\\';
+            out += 'u';
+            break;
+        }
+        default: {
+            out += '\\';
+            out += n;
+            break;
+        }
         }
     }
     return out;
@@ -168,7 +204,7 @@ bool JsonFindString(const std::string& body, const std::string& key, std::string
         }
     }
     if (p >= body.size()) {
-        return false; // 缺少闭合引号
+        return false;  // 缺少闭合引号
     }
     out = JsonUnescape(raw);
     return true;
@@ -190,4 +226,4 @@ bool JsonFindBool(const std::string& body, const std::string& key, bool& out) {
     return false;
 }
 
-} // namespace dcache
+}  // namespace dcache

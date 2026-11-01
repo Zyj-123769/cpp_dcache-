@@ -10,4 +10,4 @@ std::string UrlEncodeComponent(const std::string& s);
 // 对 URL 路径段做百分号解码（%XX）；非法序列原样保留。
 std::string UrlDecodeComponent(const std::string& s);
 
-} // namespace dcache
+}  // namespace dcache

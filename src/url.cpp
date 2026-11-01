@@ -5,18 +5,21 @@ namespace dcache {
 namespace {
 
 bool is_unreserved(char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+           c == '_' || c == '.' || c == '~';
 }
 
 int hex_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
     return -1;
 }
 
-} // namespace
+}  // namespace
 
 std::string UrlEncodeComponent(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
@@ -52,4 +55,4 @@ std::string UrlDecodeComponent(const std::string& s) {
     return out;
 }
 
-} // namespace dcache
+}  // namespace dcache

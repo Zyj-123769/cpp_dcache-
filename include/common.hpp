@@ -16,16 +16,16 @@ using Value = std::string;
 //   1. 对端抖一下，负缓存就把那条并不存在的结论记住 30s，用户连续看到「数据不存在」；
 //   2. 调用方也分不清该返回 404 还是 503，监控上永远看不出后端在故障。
 enum class GetStatus {
-    kOk,       // 数据存在，value 有效
-    kNotFound, // 数据确定不存在（可安全做负缓存，防穿透）
-    kError     // 没能得到答案，value 无意义，错误信息见 error
+    kOk,        // 数据存在，value 有效
+    kNotFound,  // 数据确定不存在（可安全做负缓存，防穿透）
+    kError      // 没能得到答案，value 无意义，错误信息见 error
 };
 
 // 一次读取的结果。
 struct GetResult {
-    GetStatus   status = GetStatus::kNotFound;
-    Value       value;
-    std::string error; // 仅 kError 有意义，用于日志与响应体诊断
+    GetStatus status = GetStatus::kNotFound;
+    Value value;
+    std::string error;  // 仅 kError 有意义，用于日志与响应体诊断
 
     GetResult() = default;
 
@@ -57,4 +57,4 @@ struct GetResult {
 // 单机模式下直接来自 mock/真实数据源；分布式模式下仅由「负责节点」调用。
 using Getter = std::function<GetResult(const std::string& key)>;
 
-} // namespace dcache
+}  // namespace dcache

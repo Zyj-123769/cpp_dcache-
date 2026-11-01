@@ -21,4 +21,4 @@ bool DecodeResult(const std::string& body, std::string& value, bool& found);
 bool JsonFindString(const std::string& body, const std::string& key, std::string& out);
 bool JsonFindBool(const std::string& body, const std::string& key, bool& out);
 
-} // namespace dcache
+}  // namespace dcache

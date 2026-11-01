@@ -18,10 +18,18 @@ std::string PromLabelEscape(const std::string& value) {
     out.reserve(value.size());
     for (char c : value) {
         switch (c) {
-            case '\\': out += "\\\\"; break;
-            case '"':  out += "\\\""; break;
-            case '\n': out += "\\n";  break;
-            default:   out += c;      break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        default:
+            out += c;
+            break;
         }
     }
     return out;
@@ -43,22 +51,21 @@ void AppendHelpType(std::string& out, const char* name, const char* type, const 
 // 用表驱动而不是逐个手写，是为了让「新增一个指标」只改一行——
 // 手写六遍 out += "dcache_group_xxx{group=..." 这种代码，漏一个也不会有任何报错。
 struct GroupMetricDef {
-    const char*                name;
-    const char*                type;
-    const char*                help;
-    std::uint64_t Group::Stats::*field;
+    const char* name;
+    const char* type;
+    const char* help;
+    std::uint64_t Group::Stats::* field;
 };
 
-} // namespace
+}  // namespace
 
 Node::Node(std::string self_addr, int virtual_nodes)
-    : self_(std::move(self_addr)),
-      pool_(std::make_shared<HttpPeerPool>(self_, virtual_nodes)) {}
+    : self_(std::move(self_addr)), pool_(std::make_shared<HttpPeerPool>(self_, virtual_nodes)) {}
 
 Group* Node::AddGroup(const std::string& name, std::size_t capacity, Getter getter,
                       std::uint64_t default_ttl_ms, std::uint64_t penetration_ttl_ms) {
-    auto g = std::make_shared<Group>(name, capacity, std::move(getter),
-                                     default_ttl_ms, penetration_ttl_ms);
+    auto g = std::make_shared<Group>(name, capacity, std::move(getter), default_ttl_ms,
+                                     penetration_ttl_ms);
     g->SetPeers(pool_);
 
     std::lock_guard<std::mutex> lk(mtx_);
@@ -93,13 +100,13 @@ GetResult Node::Get(const std::string& group, const std::string& key) {
 }
 
 void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
-    resp.status = 200;
+    resp.status                  = 200;
     resp.headers["Content-Type"] = "application/json";
 
     if (req.method != "GET") {
-        resp.status = 405;
+        resp.status           = 405;
         resp.headers["Allow"] = "GET";
-        resp.body   = "{\"error\":\"method not allowed\"}";
+        resp.body             = "{\"error\":\"method not allowed\"}";
         return;
     }
 
@@ -107,7 +114,7 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         // Prometheus 抓取端点。Content-Type 必须带 version=0.0.4，
         // 否则部分版本的 Prometheus 会按旧格式解析并报错。
         resp.headers["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8";
-        resp.body = BuildMetrics();
+        resp.body                    = BuildMetrics();
         return;
     }
 
@@ -123,7 +130,7 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         return;
     }
 
-    const std::string rest = req.path.substr(prefix.size()); // "group/key"
+    const std::string rest  = req.path.substr(prefix.size());  // "group/key"
     const std::size_t slash = rest.find('/');
     if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size()) {
         resp.status = 400;
@@ -149,7 +156,7 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
     // 又把全网流量压到数据源，还能把不属于本节点的 key 塞进本地缓存。
     //
     // 判据的优先级：配置了 token 就只认 token；没配才退回「来源 IP 属于 peers」。
-    int hops = 0;
+    int hops     = 0;
     auto hops_it = req.headers.find("X-DCache-Hops");
     if (hops_it != req.headers.end()) {
         std::string token;
@@ -161,7 +168,7 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         if (pool_->IsTrustedRequest(req.remote_ip, token)) {
             const int parsed = std::atoi(hops_it->second.c_str());
             hops = parsed < 0 ? 0
-                 : (parsed > Group::kMaxForwardHops ? Group::kMaxForwardHops : parsed);
+                              : (parsed > Group::kMaxForwardHops ? Group::kMaxForwardHops : parsed);
         } else {
             // 有人带着内部语义头来但过不了校验：按 hops=0 处理（等价外部客户端），
             // 同时记账。这类伪造尝试在访问日志里看不出任何异常，只能靠计数器暴露。
@@ -176,18 +183,17 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
     //   不存在 → 200 {"value":"","found":false}（保留既有节点间协议，负缓存依赖它）
     //   出错   → 503 {"error":..}（对端/客户端据此判定为 error，不会写负缓存）
     switch (r.status) {
-        case GetStatus::kOk:
-            resp.body = EncodeResult(r.value, true);
-            break;
-        case GetStatus::kNotFound:
-            resp.body = EncodeResult(Value{}, false);
-            break;
-        case GetStatus::kError:
-            resp.status = 503;
-            resp.body   = "{\"error\":\"" +
-                          JsonEscape(r.error.empty() ? std::string("upstream error") : r.error) +
-                          "\"}";
-            break;
+    case GetStatus::kOk:
+        resp.body = EncodeResult(r.value, true);
+        break;
+    case GetStatus::kNotFound:
+        resp.body = EncodeResult(Value{}, false);
+        break;
+    case GetStatus::kError:
+        resp.status = 503;
+        resp.body   = "{\"error\":\"" +
+                      JsonEscape(r.error.empty() ? std::string("upstream error") : r.error) + "\"}";
+        break;
     }
 }
 
@@ -203,15 +209,16 @@ std::string Node::DumpStats() const {
 
     std::string out = "{";
     for (std::size_t i = 0; i < snapshots.size(); ++i) {
-        const auto& kv = snapshots[i];
-        const Group::Stats& s = kv.second;
+        const auto& kv            = snapshots[i];
+        const Group::Stats& s     = kv.second;
         const std::uint64_t denom = s.local_hit + s.local_miss;
-        const double hit_rate = denom ? static_cast<double>(s.local_hit) / denom : 0.0;
+        const double hit_rate     = denom ? static_cast<double>(s.local_hit) / denom : 0.0;
 
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.4f", hit_rate);
 
-        if (i > 0) out += ",";
+        if (i > 0)
+            out += ",";
         out += "\"" + JsonEscape(kv.first) + "\":{";
         out += "\"local_hit\":" + std::to_string(s.local_hit);
         out += ",\"local_miss\":" + std::to_string(s.local_miss);
@@ -238,9 +245,11 @@ std::string Node::BuildMetrics() const {
 
     static const GroupMetricDef kGroupMetrics[] = {
         {"dcache_group_local_hit_total", "counter", "本地 LRU 命中次数", &Group::Stats::local_hit},
-        {"dcache_group_local_miss_total", "counter", "本地 LRU 未命中次数", &Group::Stats::local_miss},
+        {"dcache_group_local_miss_total", "counter", "本地 LRU 未命中次数",
+         &Group::Stats::local_miss},
         {"dcache_group_source_fetch_total", "counter", "本机回源次数", &Group::Stats::source_fetch},
-        {"dcache_group_remote_fetch_total", "counter", "转发到对端的次数", &Group::Stats::remote_fetch},
+        {"dcache_group_remote_fetch_total", "counter", "转发到对端的次数",
+         &Group::Stats::remote_fetch},
         {"dcache_group_error_total", "counter", "回源或转发失败次数（结果不入缓存）",
          &Group::Stats::error_count},
         {"dcache_group_cache_size", "gauge", "当前本地缓存条目数", &Group::Stats::cache_size},
@@ -266,7 +275,8 @@ std::string Node::BuildMetrics() const {
     for (const auto& kv : snapshots) {
         const std::uint64_t hit   = kv.second.local_hit;
         const std::uint64_t denom = hit + kv.second.local_miss;
-        const double rate = denom == 0 ? 0.0 : static_cast<double>(hit) / static_cast<double>(denom);
+        const double rate =
+            denom == 0 ? 0.0 : static_cast<double>(hit) / static_cast<double>(denom);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.6f", rate);
         out += "dcache_group_hit_rate{group=\"";
@@ -288,4 +298,4 @@ std::string Node::BuildMetrics() const {
     return out;
 }
 
-} // namespace dcache
+}  // namespace dcache

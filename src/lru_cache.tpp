@@ -18,7 +18,7 @@ auto LruCache<K, V>::get(const key_type& key) -> std::optional<value_type> {
 
     Node& node = *it->second;
     if (expired(node, now)) {
-        order_.erase(it->second);   // 惰性删除过期条目
+        order_.erase(it->second);  // 惰性删除过期条目
         index_.erase(it);
         ++stats_.misses;
         return std::nullopt;
@@ -33,27 +33,26 @@ template <typename K, typename V>
 void LruCache<K, V>::put(const key_type& key, const value_type& value, std::uint64_t ttl_ms) {
     std::lock_guard<std::mutex> lk(mtx_);
 
-    const auto expire_at =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+    const auto expire_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
 
     auto it = index_.find(key);
     if (it != index_.end()) {
         // 更新已有条目：更新值、过期时刻，并移到头部。
-        it->second->value    = value;
-        it->second->has_ttl  = (ttl_ms != 0);
+        it->second->value     = value;
+        it->second->has_ttl   = (ttl_ms != 0);
         it->second->expire_at = expire_at;
         touch(it->second);
         return;
     }
 
     if (capacity_ == 0) {
-        return; // 禁用缓存：直接丢弃
+        return;  // 禁用缓存：直接丢弃
     }
 
     Node node;
-    node.key      = key;
-    node.value    = value;
-    node.has_ttl  = (ttl_ms != 0);
+    node.key       = key;
+    node.value     = value;
+    node.has_ttl   = (ttl_ms != 0);
     node.expire_at = expire_at;
 
     order_.push_front(std::move(node));
@@ -131,4 +130,4 @@ bool LruCache<K, V>::expired(const Node& n, std::chrono::steady_clock::time_poin
     return n.has_ttl && now >= n.expire_at;
 }
 
-} // namespace dcache
+}  // namespace dcache

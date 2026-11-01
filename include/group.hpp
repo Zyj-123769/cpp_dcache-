@@ -25,17 +25,16 @@ class PeerPicker;
 class Group {
 public:
     struct Stats {
-        std::uint64_t local_hit     = 0;
-        std::uint64_t local_miss    = 0;
-        std::uint64_t source_fetch  = 0; // 本机回源次数
-        std::uint64_t remote_fetch   = 0; // 转发到远端次数
-        std::uint64_t error_count   = 0; // 回源/转发失败次数（结果未缓存）
-        std::uint64_t cache_size    = 0;
+        std::uint64_t local_hit    = 0;
+        std::uint64_t local_miss   = 0;
+        std::uint64_t source_fetch = 0;  // 本机回源次数
+        std::uint64_t remote_fetch = 0;  // 转发到远端次数
+        std::uint64_t error_count  = 0;  // 回源/转发失败次数（结果未缓存）
+        std::uint64_t cache_size   = 0;
     };
 
-    Group(std::string name, std::size_t capacity, Getter getter,
-          std::uint64_t default_ttl_ms      = 0,
-          std::uint64_t penetration_ttl_ms  = 30000);
+    Group(std::string name, std::size_t capacity, Getter getter, std::uint64_t default_ttl_ms = 0,
+          std::uint64_t penetration_ttl_ms = 30000);
 
     const std::string& Name() const { return name_; }
 
@@ -57,16 +56,16 @@ private:
     std::uint64_t ttl_with_jitter(std::uint64_t base_ms, const std::string& key) const;
 
     std::string name_;
-    Getter      getter_;
+    Getter getter_;
     std::uint64_t default_ttl_ms_;
     std::uint64_t penetration_ttl_ms_;
 
     LruCache<std::string, GetResult> cache_;
-    SingleFlight<GetResult>          flight_;
-    std::shared_ptr<PeerPicker>     picker_;
+    SingleFlight<GetResult> flight_;
+    std::shared_ptr<PeerPicker> picker_;
 
     mutable std::mutex stats_mtx_;
-    Stats              stats_;
+    Stats stats_;
 };
 
-} // namespace dcache
+}  // namespace dcache

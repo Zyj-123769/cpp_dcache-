@@ -24,7 +24,7 @@ bool split_addr(const std::string& addr, std::string& host, std::uint16_t& port)
     if (colon == std::string::npos || colon == 0 || colon + 1 >= addr.size()) {
         return false;
     }
-    host = addr.substr(0, colon);
+    host  = addr.substr(0, colon);
     int p = std::atoi(addr.substr(colon + 1).c_str());
     if (p <= 0 || p > 65535) {
         return false;
@@ -33,11 +33,10 @@ bool split_addr(const std::string& addr, std::string& host, std::uint16_t& port)
     return true;
 }
 
-} // namespace
+}  // namespace
 
 HttpPeerPool::HttpPeerPool(std::string self_addr, int virtual_nodes)
-    : self_(std::move(self_addr)),
-      ring_(std::make_shared<ConsistentHash>(virtual_nodes)) {}
+    : self_(std::move(self_addr)), ring_(std::make_shared<ConsistentHash>(virtual_nodes)) {}
 
 void HttpPeerPool::SetPeers(const std::vector<std::string>& peers) {
     // 用相同虚拟节点数重建环，确保新旧一致。
@@ -146,8 +145,7 @@ GetResult HttpPeerPool::GetFromPeer(const std::string& peer, const std::string& 
         if (http_status == 0) {
             return GetResult::Error("peer " + peer + " unreachable or timed out");
         }
-        return GetResult::Error("peer " + peer + " returned HTTP " +
-                                std::to_string(http_status));
+        return GetResult::Error("peer " + peer + " returned HTTP " + std::to_string(http_status));
     }
 
     std::string value;
@@ -158,4 +156,4 @@ GetResult HttpPeerPool::GetFromPeer(const std::string& peer, const std::string& 
     return found ? GetResult::Ok(std::move(value)) : GetResult::NotFound();
 }
 
-} // namespace dcache
+}  // namespace dcache

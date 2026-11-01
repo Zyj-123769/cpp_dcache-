@@ -21,7 +21,7 @@ bool split_host_port(const std::string& addr, std::string& host, std::uint16_t& 
     if (pos == std::string::npos || pos == 0 || pos + 1 >= addr.size()) {
         return false;
     }
-    host = addr.substr(0, pos);
+    host  = addr.substr(0, pos);
     int p = std::atoi(addr.substr(pos + 1).c_str());
     if (p <= 0 || p > 65535) {
         return false;
@@ -31,44 +31,65 @@ bool split_host_port(const std::string& addr, std::string& host, std::uint16_t& 
 }
 
 struct Options {
-    std::string target   = "127.0.0.1:8001";
-    std::string group    = "scores";
-    int         threads  = 8;
-    int         requests = 10000;
-    int         keys     = 1000;
-    int         timeout  = 2000;
+    std::string target = "127.0.0.1:8001";
+    std::string group  = "scores";
+    int threads        = 8;
+    int requests       = 10000;
+    int keys           = 1000;
+    int timeout        = 2000;
 };
 
 void usage(const char* argv0) {
-    std::cerr <<
-        "usage: " << argv0 << " [options]\n"
-        "  --target <host:port>   目标节点地址 (默认 127.0.0.1:8001)\n"
-        "  --group <name>         缓存分组名 (默认 scores)\n"
-        "  --threads <n>          并发线程数 (默认 8)\n"
-        "  --requests <n>         总请求数 (默认 10000)\n"
-        "  --keys <n>             随机 key 空间大小 (默认 1000)\n"
-        "  --timeout <ms>         单请求超时 (默认 2000)\n";
+    std::cerr << "usage: " << argv0
+              << " [options]\n"
+                 "  --target <host:port>   目标节点地址 (默认 127.0.0.1:8001)\n"
+                 "  --group <name>         缓存分组名 (默认 scores)\n"
+                 "  --threads <n>          并发线程数 (默认 8)\n"
+                 "  --requests <n>         总请求数 (默认 10000)\n"
+                 "  --keys <n>             随机 key 空间大小 (默认 1000)\n"
+                 "  --timeout <ms>         单请求超时 (默认 2000)\n";
 }
 
 bool parse_args(int argc, char** argv, Options& o) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        auto need = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) { std::cerr << "缺少 " << name << " 的值\n"; return nullptr; }
+        auto need           = [&](const char* name) -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << "缺少 " << name << " 的值\n";
+                return nullptr;
+            }
             return argv[++i];
         };
         if (a == "--target") {
-            const char* v = need("--target"); if (!v) return false; o.target = v;
+            const char* v = need("--target");
+            if (!v)
+                return false;
+            o.target = v;
         } else if (a == "--group") {
-            const char* v = need("--group"); if (!v) return false; o.group = v;
+            const char* v = need("--group");
+            if (!v)
+                return false;
+            o.group = v;
         } else if (a == "--threads") {
-            const char* v = need("--threads"); if (!v) return false; o.threads = std::atoi(v);
+            const char* v = need("--threads");
+            if (!v)
+                return false;
+            o.threads = std::atoi(v);
         } else if (a == "--requests") {
-            const char* v = need("--requests"); if (!v) return false; o.requests = std::atoi(v);
+            const char* v = need("--requests");
+            if (!v)
+                return false;
+            o.requests = std::atoi(v);
         } else if (a == "--keys") {
-            const char* v = need("--keys"); if (!v) return false; o.keys = std::atoi(v);
+            const char* v = need("--keys");
+            if (!v)
+                return false;
+            o.keys = std::atoi(v);
         } else if (a == "--timeout") {
-            const char* v = need("--timeout"); if (!v) return false; o.timeout = std::atoi(v);
+            const char* v = need("--timeout");
+            if (!v)
+                return false;
+            o.timeout = std::atoi(v);
         } else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -81,16 +102,19 @@ bool parse_args(int argc, char** argv, Options& o) {
     return true;
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     Options o;
     if (!parse_args(argc, argv, o)) {
         return 1;
     }
-    if (o.threads < 1) o.threads = 1;
-    if (o.requests < 1) o.requests = 1;
-    if (o.keys < 1) o.keys = 1;
+    if (o.threads < 1)
+        o.threads = 1;
+    if (o.requests < 1)
+        o.requests = 1;
+    if (o.keys < 1)
+        o.keys = 1;
 
     std::string host;
     std::uint16_t port = 0;
@@ -102,8 +126,8 @@ int main(int argc, char** argv) {
     std::atomic<std::uint64_t> ok{0};
     std::atomic<std::uint64_t> found{0};
 
-    const int per = o.requests / o.threads;
-    const int rem = o.requests % o.threads;
+    const int per                 = o.requests / o.threads;
+    const int rem                 = o.requests % o.threads;
     const std::uint32_t base_seed = 12345;
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -137,10 +161,9 @@ int main(int argc, char** argv) {
     const auto t1 = std::chrono::steady_clock::now();
 
     const double secs = std::chrono::duration<double>(t1 - t0).count();
-    const double qps = secs > 0 ? static_cast<double>(ok.load()) / secs : 0.0;
-    const double found_rate = ok.load() > 0
-        ? static_cast<double>(found.load()) / static_cast<double>(ok.load())
-        : 0.0;
+    const double qps  = secs > 0 ? static_cast<double>(ok.load()) / secs : 0.0;
+    const double found_rate =
+        ok.load() > 0 ? static_cast<double>(found.load()) / static_cast<double>(ok.load()) : 0.0;
 
     std::cout << "====== 压测结果 ======\n";
     std::cout << "target       : " << o.target << "\n";

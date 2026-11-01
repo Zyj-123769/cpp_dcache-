@@ -24,17 +24,18 @@ public:
     // 返回负责该 key 的节点地址；空环返回 ""。
     std::string GetNode(const std::string& key) const;
 
-    bool                    Contains(const std::string& node) const;
-    std::size_t             NodeCount() const;  // 物理节点数
-    std::size_t             RingSize() const;   // 虚拟节点数
-    int                     VirtualNodes() const;
+    bool Contains(const std::string& node) const;
+    std::size_t NodeCount() const;  // 物理节点数
+    std::size_t RingSize() const;   // 虚拟节点数
+    int VirtualNodes() const;
 
 private:
     std::uint32_t hash(const std::string& s) const;
 
-    int                                      virtual_nodes_;
-    std::map<std::uint32_t, std::string>     ring_;   // 虚拟节点哈希 -> 物理节点
-    std::unordered_map<std::string, std::vector<std::uint32_t>> vnodes_; // 物理节点 -> 其虚拟节点哈希列表
+    int virtual_nodes_;
+    std::map<std::uint32_t, std::string> ring_;  // 虚拟节点哈希 -> 物理节点
+    std::unordered_map<std::string, std::vector<std::uint32_t>>
+        vnodes_;  // 物理节点 -> 其虚拟节点哈希列表
 };
 
-} // namespace dcache
+}  // namespace dcache

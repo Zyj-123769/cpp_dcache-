@@ -29,8 +29,7 @@ public:
 
     // 注册分组（group name 在同一 Node 内唯一），返回其指针（内存由 Node 持有）。
     Group* AddGroup(const std::string& name, std::size_t capacity, Getter getter,
-                    std::uint64_t default_ttl_ms     = 0,
-                    std::uint64_t penetration_ttl_ms = 30000);
+                    std::uint64_t default_ttl_ms = 0, std::uint64_t penetration_ttl_ms = 30000);
 
     Group* FindGroup(const std::string& name);
 
@@ -66,7 +65,7 @@ private:
     std::string self_;
     std::shared_ptr<HttpPeerPool> pool_;
     std::unordered_map<std::string, std::shared_ptr<Group>> groups_;
-    mutable std::mutex mtx_; // 保护 groups_
+    mutable std::mutex mtx_;  // 保护 groups_
 
     // 携带 X-DCache-Hops 但未通过可信校验的请求数。
     // 这个计数是「有人在伪造内部头」的唯一信号，必须对外可见（/metrics），
@@ -76,4 +75,4 @@ private:
     MetricsHook metrics_hook_;
 };
 
-} // namespace dcache
+}  // namespace dcache
