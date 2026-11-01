@@ -38,6 +38,34 @@ GetResult counting_getter(const std::string& key) {
     return GetResult(true, "v:" + key);
 }
 
+// 从 Prometheus 文本格式里取某个指标的数值；找不到返回 -1。
+//
+// 为什么不能用 body.find("name ") 然后 strtol：
+// 输出里 `# HELP name <说明>` 和 `# TYPE name counter` 都以 name 开头，
+// find 会先命中 HELP 行，随后 strtol 拿「说明」去解析，得到 0。
+// 于是「计数没有增长」这种缺陷会被测试自己悄悄掩盖——断言恒成立。
+// 这里按行扫描、跳过 # 开头的元数据行，只认真正的样本行。
+long long MetricValue(const std::string& body, const std::string& name) {
+    const std::string prefix = name + " ";
+    std::size_t pos          = 0;
+    while (pos < body.size()) {
+        std::size_t eol = body.find('\n', pos);
+        if (eol == std::string::npos) {
+            eol = body.size();
+        }
+        const std::string line = body.substr(pos, eol - pos);
+        pos                    = eol + 1;
+
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.compare(0, prefix.size(), prefix) == 0) {
+            return std::strtoll(line.c_str() + prefix.size(), nullptr, 10);
+        }
+    }
+    return -1;
+}
+
 // 可控的「对端」：先连续报错（模拟超时/5xx），再恢复。
 // 用来验证错误结果不会被写进负缓存。
 class FlakyPicker : public PeerPicker {
@@ -474,18 +502,13 @@ int main() {
             return resp;
         };
 
-        auto rejected = [&]() -> long {
+        auto rejected = [&]() -> long long {
             HttpRequest m;
             m.method = "GET";
             m.path   = "/metrics";
             HttpResponse mr;
             node.ServeHTTP(m, mr);
-            const std::string needle = "dcache_hops_rejected_total ";
-            const std::size_t p      = mr.body.find(needle);
-            if (p == std::string::npos) {
-                return -1;
-            }
-            return std::strtol(mr.body.c_str() + p + needle.size(), nullptr, 10);
+            return MetricValue(mr.body, "dcache_hops_rejected_total");
         };
 
         CHECK(rejected() == 0);
@@ -521,7 +544,7 @@ int main() {
         CHECK(resp.body.find("dcache_group_source_fetch_total{group=\"scores\"} 1") !=
               std::string::npos);
         CHECK(resp.body.find("dcache_group_cache_size{group=\"scores\"} 1") != std::string::npos);
-        CHECK(resp.body.find("dcache_hops_rejected_total 0") != std::string::npos);
+        CHECK(MetricValue(resp.body, "dcache_hops_rejected_total") == 0);
     }
 
     // N. token 比较的行为正确性（常量时间是对实现的要求，这里只验语义）。
