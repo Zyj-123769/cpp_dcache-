@@ -23,5 +23,11 @@ bin/
 __pycache__/
 *.log
 
+# libFuzzer 在仓库根目录写出的崩溃 / 超时样本（复现用，不入库）
+crash-*
+leak-*
+timeout-*
+oom-*
+
 # 本地 Agent 状态（工作记忆 / 会话缓存），不入库
 .workbuddy/

@@ -11,3 +11,7 @@
 *.gif  binary
 *.ico  binary
 *.pdf  binary
+
+# fuzz 语料里的 HTTP 样本必须逐字节保留 CRLF：
+# 换成 LF 之后种子本身就不是合法请求了，fuzzer 会从一堆废样本起步。
+fuzz/corpus/http_request/* -text

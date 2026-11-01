@@ -49,6 +49,21 @@ if(DCACHE_COVERAGE)
     endif()
 endif()
 
+# 可选 libFuzzer 目标：-DDCACHE_FUZZ=ON。只支持 clang —— libFuzzer 随 clang 分发，
+# gcc 侧没有等价物（AFL++ 是另一套工具链，先不引入）。
+option(DCACHE_FUZZ "构建 libFuzzer 目标（需要 clang）" OFF)
+if(DCACHE_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "DCACHE_FUZZ 需要 clang：libFuzzer 只随 clang 提供")
+    endif()
+    # fuzzer-no-link = 只插覆盖率探针、不引入 main。库必须一起插桩，否则 fuzzer
+    # 走的是「纯随机」模式：它看不到任何「哪些分支被走到过」的信息，
+    # 几分钟的随机测试未必比手写用例强。main 由各 fuzz 目标自己链接 -fsanitize=fuzzer。
+    # -O1：比 -O0 快好几倍，又不至于像 -O2 那样把变量优化掉、让崩溃栈难以对应源码。
+    add_compile_options(-fsanitize=fuzzer-no-link,address -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=address)
+endif()
+
 # 统一告警开关。必须在 target 定义前声明，才能作用于 dcache_core 本身。
 function(dcache_add_warnings target)
     if(MSVC)
@@ -63,6 +78,7 @@ add_library(dcache_core
     src/consistent_hash.cpp
     src/json.cpp
     src/http_client.cpp
+    src/http_parser.cpp
     src/http_server.cpp
     src/group.cpp
     src/peer_pool.cpp
@@ -90,6 +106,7 @@ set(DCACHE_TESTS
     test_singleflight
     test_json
     test_url
+    test_http_parser
     test_node)
 foreach(t IN LISTS DCACHE_TESTS)
     add_executable(${t} tests/${t}.cpp)
@@ -101,3 +118,19 @@ enable_testing()
 foreach(t IN LISTS DCACHE_TESTS)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
+
+# libFuzzer 目标：只在 DCACHE_FUZZ=ON 时存在。普通构建里它们连编译都不该发生——
+# 没有 -fsanitize=fuzzer 就找不到 LLVMFuzzerTestOneInput 的运行时，链接必然失败。
+if(DCACHE_FUZZ)
+    set(DCACHE_FUZZERS
+        fuzz_json
+        fuzz_url
+        fuzz_http_request)
+    foreach(f IN LISTS DCACHE_FUZZERS)
+        add_executable(${f} fuzz/${f}.cpp)
+        target_link_libraries(${f} PRIVATE dcache_core)
+        # 这里才引入 libFuzzer 的 main 与驱动逻辑。
+        target_link_options(${f} PRIVATE -fsanitize=fuzzer,address)
+        dcache_add_warnings(${f})
+    endforeach()
+endif()

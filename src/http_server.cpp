@@ -16,11 +16,11 @@
 #include <deque>
 #include <vector>
 
+#include "http_parser.hpp"
+
 namespace dcache {
 
 namespace {
-
-constexpr std::size_t kMaxRequestSize = 64 * 1024;
 
 // 单机允许同时挂起的连接上限。每个未完成的连接要占 64KB 读缓冲，
 // 不设上限时「开一堆连接只发半个请求」就能把节点内存吃干净。
@@ -33,76 +33,6 @@ constexpr int kSweepIntervalMs = 1000;
 // 阻塞写响应的最长等待时间。没有它，一个「只发请求不读响应」的客户端
 // 就能让 send() 永久阻塞，几个连接即可占满全部 worker（廉价 DoS）。
 constexpr int kSendTimeoutMs = 2000;
-
-// 解析请求；返回 1=完整，0=还需更多数据，-1=报文非法，-2=声明体过大。
-// consumed（rc==1 时有效）：这条请求占用的字节数，用来判断缓冲区里是否还有第二条请求。
-int parse_request(const std::string& data, HttpRequest& req, std::size_t& consumed) {
-    consumed               = 0;
-    const std::size_t hpos = data.find("\r\n\r\n");
-    if (hpos == std::string::npos) {
-        return data.size() > kMaxRequestSize ? -1 : 0;
-    }
-
-    const std::string header_block = data.substr(0, hpos);
-    const std::size_t line_end     = header_block.find("\r\n");
-    const std::string reqline      = header_block.substr(0, line_end);
-
-    // 请求行："GET /api/g/k HTTP/1.1"
-    std::size_t sp1 = reqline.find(' ');
-    std::size_t sp2 = reqline.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) {
-        return -1;
-    }
-    req.method = reqline.substr(0, sp1);
-    req.path   = reqline.substr(sp1 + 1, sp2 - sp1 - 1);
-
-    // 头部行（可无）。
-    req.headers.clear();
-    std::size_t pos = line_end + 2;
-    while (pos < hpos) {
-        std::size_t line_end2 = header_block.find("\r\n", pos);
-        if (line_end2 == std::string::npos)
-            line_end2 = hpos;
-        const std::string line = header_block.substr(pos, line_end2 - pos);
-        if (!line.empty()) {
-            const std::size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                std::string k = line.substr(0, colon);
-                std::string v = line.substr(colon + 1);
-                if (!v.empty() && v[0] == ' ')
-                    v.erase(0, 1);
-                req.headers[k] = v;
-            }
-        }
-        pos = line_end2 + 2;
-    }
-
-    // 请求体（Content-Length）。本项目只有 GET，body 通常为空。
-    long content_length = 0;
-    auto it             = req.headers.find("Content-Length");
-    if (it == req.headers.end())
-        it = req.headers.find("content-length");
-    if (it != req.headers.end()) {
-        content_length = std::strtol(it->second.c_str(), nullptr, 10);
-        if (content_length < 0) {
-            return -1;  // 非法（负数）Content-Length
-        }
-    }
-
-    // 声明体超过上限时立刻判失败：读缓冲本来就在 kMaxRequestSize 处封顶，
-    // 这种请求永远等不到「收全」，只会把这个连接永久挂在 conns_ 里。
-    if (static_cast<std::size_t>(content_length) > kMaxRequestSize) {
-        return -2;
-    }
-
-    const std::size_t total = hpos + 4 + static_cast<std::size_t>(content_length);
-    if (data.size() < total) {
-        return 0;  // body 未收完
-    }
-    req.body = data.substr(hpos + 4, static_cast<std::size_t>(content_length));
-    consumed = total;
-    return 1;
-}
 
 // 取头部值并做大小写不敏感比较（HTTP 头名与 Connection 的值都可能有大小写差异）。
 bool header_equals_ci(const HttpRequest& req, const char* name, const char* value) {
@@ -516,12 +446,12 @@ void HttpServer::handle_read(int fd) {
 
     HttpRequest req;
     std::size_t consumed = 0;
-    int rc               = parse_request(buf, req, consumed);
-    if (rc == 0 && !eof) {
+    int rc               = ParseRequest(buf, req, consumed);
+    if (rc == kParseIncomplete && !eof) {
         return;  // 等待更多数据（空闲超时由 sweep_idle 兜底回收）
     }
 
-    if (rc == 1) {
+    if (rc == kParseOk) {
         // 完整请求：从 epoll/conns_ 摘除，fd 所有权转移给工作线程。
         Task t;
         t.fd            = fd;
