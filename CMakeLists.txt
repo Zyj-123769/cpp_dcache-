@@ -35,6 +35,20 @@ if(DCACHE_SANITIZE)
     endif()
 endif()
 
+# 可选覆盖率插桩：-DDCACHE_COVERAGE=ON（gcc/clang 的 --coverage，供 gcovr/lcov 读取）。
+# 同样必须放在所有 target 之前，否则只有部分 TU 被插桩，算出来的百分比没有意义。
+# 不要和 DCACHE_SANITIZE 一起用：ASan 下进程异常退出会丢掉 .gcda，覆盖率会莫名偏低。
+option(DCACHE_COVERAGE "启用 --coverage 插桩（gcov/gcovr/lcov 用）" OFF)
+if(DCACHE_COVERAGE)
+    if(MSVC)
+        message(WARNING "MSVC 不支持 --coverage，DCACHE_COVERAGE 已忽略")
+    else()
+        # -O0：优化会把多行合并/删除，行号统计随之失真，所以关掉优化再测。
+        add_compile_options(--coverage -O0 -g)
+        add_link_options(--coverage)
+    endif()
+endif()
+
 # 统一告警开关。必须在 target 定义前声明，才能作用于 dcache_core 本身。
 function(dcache_add_warnings target)
     if(MSVC)

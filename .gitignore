@@ -1,5 +1,7 @@
 # 构建产物
 build/
+# 各门禁的独立构建目录：build-san / build-tsan / build-lint / build-cov
+build-*/
 bin/
 *.o
 *.obj

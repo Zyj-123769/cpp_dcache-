@@ -52,3 +52,32 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Format & static analysis
         run: bash scripts/ci.sh lint
+
+  # 覆盖率是唯一能发现「测试还在跑、但已经碰不到新分支」的关卡。
+  # 其余三个 job 只能说「跑到的都对了」，说不了「该跑的都跑了」。
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcovr
+        run: |
+          python -m pip install --user "gcovr>=6"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Coverage gate
+        run: bash scripts/ci.sh coverage
+      # 报告必须在失败时也留下来：日志要仓库权限才看得到，
+      # 而 job summary 在运行页面上直接可见，这是匿名能读到的唯一出口。
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f build-cov/coverage.txt ]; then
+            {
+              echo "### 行覆盖率（src/ + include/）"
+              echo ''
+              echo '```'
+              cat build-cov/coverage.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "没有生成 build-cov/coverage.txt（构建或 gcovr 阶段就失败了）" >> "$GITHUB_STEP_SUMMARY"
+          fi
