@@ -6,6 +6,9 @@
 
 #include <cerrno>
 #include <climits>
+#include <csignal>
+#include <cstring>
+#include <mutex>
 #include <string>
 
 namespace dcache {
@@ -49,6 +52,28 @@ int clamp_len(std::size_t len) {
     return len > static_cast<std::size_t>(INT_MAX) ? INT_MAX : static_cast<int>(len);
 }
 
+// OpenSSL 的默认 BIO 用 write(2)，不像本项目自己的 send_all / write_all 那样
+// 带 MSG_NOSIGNAL。于是「客户端发完请求立刻断开，服务端正在写响应」这种再正常
+// 不过的行为会让进程收到 SIGPIPE 直接退出 —— **一个客户端就能杀掉节点**。
+//
+// 这个缺陷躲过了 ASan/UBSan、TSan、fuzz 和四批人工 review，因为之前六组 TLS
+// 用例里客户端都是「写完再读、读够才关」，从没构造出「写到已关闭连接」的那一刻。
+// 是证书热加载那组用例把连接寿命拉长之后才第一次踩到。
+//
+// 修法只可能是忽略 SIGPIPE：忽略之后 SSL_write 返回 -1（EPIPE），走的是已有的
+// 写失败分支——关掉这条连接，进程继续服务。不给 SSL 换自定义 BIO（用带
+// MSG_NOSIGNAL 的 send）是因为那要维护读写回调、处理 SSL_set_bio 的所有权转移，
+// 改动面大一个数量级，而结果完全一样。
+void ensure_sigpipe_ignored() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        ::sigaction(SIGPIPE, &sa, nullptr);
+    });
+}
+
 }  // namespace
 
 bool Available() {
@@ -68,6 +93,10 @@ Context::~Context() {
 }
 
 std::unique_ptr<Context> Context::CreateServer(const ServerConfig& cfg, std::string& err) {
+    // 只要这个进程有 TLS 服务端，就一定会走 OpenSSL 的写路径，必须在建任何
+    // 上下文之前先把 SIGPIPE 关掉（理由见 ensure_sigpipe_ignored）。
+    ensure_sigpipe_ignored();
+
     if (cfg.cert_file.empty() || cfg.key_file.empty()) {
         err = "TLS 服务端配置缺少 cert_file 或 key_file";
         return nullptr;
@@ -116,6 +145,9 @@ std::unique_ptr<Context> Context::CreateServer(const ServerConfig& cfg, std::str
 }
 
 std::unique_ptr<Context> Context::CreateClient(const ClientConfig& cfg, std::string& err) {
+    // 客户端同样要关：转发的对端也可能在我们写请求时先断开。
+    ensure_sigpipe_ignored();
+
     if (cfg.ca_file.empty()) {
         err = "TLS 客户端缺少 CA 文件（不校验证书的 TLS 只是把明文换了个包装）";
         return nullptr;
