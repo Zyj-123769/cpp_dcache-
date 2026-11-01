@@ -1,5 +1,12 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -47,6 +54,53 @@ public:
         return GetResult::Ok("v:" + key);
     }
 };
+
+// 原始 socket 客户端：构造 HttpClient 做不到的报文
+// （发完立刻关写端、声明超大 Content-Length 等）。
+// 返回 false 表示对端没给出任何响应（连接被断开）。
+bool raw_exchange(std::uint16_t port, const std::string& request,
+                  std::string& response, bool half_close) {
+    response.clear();
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+
+    struct sockaddr_in sin;
+    std::memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port   = htons(port);
+    if (::inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr) != 1 ||
+        ::connect(fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) != 0) {
+        ::close(fd);
+        return false;
+    }
+
+    std::size_t off = 0;
+    while (off < request.size()) {
+        const ssize_t n = ::send(fd, request.data() + off, request.size() - off, 0);
+        if (n <= 0) {
+            ::close(fd);
+            return false;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    if (half_close) {
+        ::shutdown(fd, SHUT_WR); // 模拟「发完请求立刻关写端」的客户端
+    }
+
+    char tmp[4096];
+    for (;;) {
+        const ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) {
+            break;
+        }
+        response.append(tmp, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    return !response.empty();
+}
 
 } // namespace
 
@@ -244,6 +298,40 @@ int main() {
         int         status = 0;
         CHECK(!HttpClient::Get("127.0.0.1", s.Port(), "/api/g/k", body, 2000, {}, &status));
         CHECK(status == 503);
+        s.Stop();
+    }
+
+    // I. 连接层回归：「发完请求立刻关写端」的客户端必须仍能拿到响应。
+    //    这类连接的同批事件是 EPOLLIN|EPOLLHUP，旧实现先判 HUP 就直接关连接，
+    //    缓冲区里那条完整请求被丢掉，客户端只看到连接被重置。
+    {
+        HttpServer s;
+        CHECK(s.Start("127.0.0.1", 0, [](const HttpRequest&, HttpResponse& resp) {
+            resp.status = 200;
+            resp.body   = "ok";
+        }, 2));
+
+        std::string resp;
+        CHECK(raw_exchange(s.Port(), "GET /x HTTP/1.1\r\nHost: a\r\n\r\n", resp, true));
+        CHECK(resp.find("200") != std::string::npos);
+        CHECK(resp.find("ok") != std::string::npos);
+        s.Stop();
+    }
+
+    // J. 连接层回归：声明超大 Content-Length 的请求必须立刻断开，而不是挂在那里等。
+    //    读缓冲在 64KB 封顶，这种请求永远「收不全」，旧实现会让连接一直占着位置。
+    {
+        HttpServer s;
+        CHECK(s.Start("127.0.0.1", 0, [](const HttpRequest&, HttpResponse& resp) {
+            resp.status = 200;
+            resp.body   = "should not happen";
+        }, 2));
+
+        std::string resp;
+        CHECK(!raw_exchange(s.Port(),
+                            "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 100000000\r\n\r\n",
+                            resp, true));
+        CHECK(resp.empty()); // 没有任何响应体 = 服务端直接断开
         s.Stop();
     }
 

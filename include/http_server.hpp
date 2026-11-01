@@ -3,6 +3,7 @@
 #include "http.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -56,13 +57,28 @@ private:
     void worker_loop();
     void cleanup();
 
+    // 关闭连接（幂等）：已移交给工作线程的 fd 不在此表内，不会被重复 close。
+    void close_conn(int fd);
+
+    // 回收长时间不活动、请求还没收全的连接（slowloris 防护）。
+    void sweep_idle();
+
     struct Conn {
         std::string read_buf;
         std::string remote_ip;  // accept 时记录，随任务传给工作线程做来源校验
+
+        // 最后一次收到数据的时刻。HTTP 请求就几十字节，正常情况下 10 秒内必然收完；
+        // 一直收不全的连接只会白占内存和 fd，必须主动回收。
+        std::chrono::steady_clock::time_point last_active;
     };
 
     int                            listen_fd_ = -1;
     int                            epoll_fd_  = -1;
+
+    // 预留给「fd 耗尽」时用的空闲 fd。EMFILE 时 accept 本身就会失败，
+    // 连「丢弃一个待处理连接」都做不到；必须先关掉它腾出一个 fd 才能破局。
+    int                            reserve_fd_ = -1;
+
     std::atomic<bool>              stop_{false};
     std::thread                    thread_;
     std::uint16_t                  port_ = 0;

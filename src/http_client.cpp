@@ -17,6 +17,11 @@ namespace dcache {
 
 namespace {
 
+// 对端响应的大小上限。没有上限时，一个异常（或恶意）的对端只要持续发送，
+// 就能把调用方节点的内存吃干净——节点间转发是内部接口，但内部接口也会出故障。
+constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
+constexpr std::size_t kMaxBodyBytes   = 8 * 1024 * 1024;
+
 bool set_timeout(int fd, int ms, int optname) {
     struct timeval tv;
     tv.tv_sec  = ms / 1000;
@@ -95,6 +100,9 @@ bool read_headers(int fd, std::string& buf, std::size_t& header_end) {
         if (pos != std::string::npos) {
             header_end = pos + 4;
             return true;
+        }
+        if (buf.size() > kMaxHeaderBytes) {
+            return false; // 响应头超限：对端可能根本不打算结束头部
         }
         ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
         if (n == 0) {
@@ -190,17 +198,25 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port,
         *http_status = status;
     }
 
+    // 声明体超限就别读了：读到一半再放弃只是浪费带宽和内存。
+    if (content_length > static_cast<long>(kMaxBodyBytes)) {
+        ::close(fd);
+        return false;
+    }
+
     std::string body;
     if (content_length >= 0) {
+        const std::size_t want = static_cast<std::size_t>(content_length);
+
         // 先把头部之外已读到的字节计入 body。
         std::size_t body_so_far = buf.size() - header_end;
-        if (body_so_far > static_cast<std::size_t>(content_length)) {
-            body_so_far = static_cast<std::size_t>(content_length);
+        if (body_so_far > want) {
+            body_so_far = want;
         }
         body.assign(buf, header_end, body_so_far);
 
         char tmp[4096];
-        while (body.size() < static_cast<std::size_t>(content_length)) {
+        while (body.size() < want) {
             ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
             if (n == 0) break;
             if (n < 0) {
@@ -208,13 +224,28 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port,
                 break;
             }
             body.append(tmp, static_cast<std::size_t>(n));
+            if (body.size() > kMaxBodyBytes) {
+                ::close(fd);
+                return false;
+            }
         }
-        if (body.size() > static_cast<std::size_t>(content_length)) {
-            body.resize(static_cast<std::size_t>(content_length));
+        if (body.size() > want) {
+            body.resize(want);
+        }
+
+        // 截断必须判失败。旧实现在这里静默接受半截 body，上层拿到的是
+        // 一份「看起来像 JSON」的残片，很容易被解析成错误的结论。
+        if (body.size() != want) {
+            ::close(fd);
+            return false;
         }
     } else {
-        // 无 Content-Length：读到对端关闭。
+        // 无 Content-Length：读到对端关闭，同时受 kMaxBodyBytes 约束。
         body.assign(buf, header_end, std::string::npos);
+        if (body.size() > kMaxBodyBytes) {
+            ::close(fd);
+            return false;
+        }
         char tmp[4096];
         for (;;) {
             ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
@@ -224,6 +255,10 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port,
                 break;
             }
             body.append(tmp, static_cast<std::size_t>(n));
+            if (body.size() > kMaxBodyBytes) {
+                ::close(fd);
+                return false;
+            }
         }
     }
 

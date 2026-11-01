@@ -130,7 +130,7 @@ curl http://127.0.0.1:8001/api/scores/k1
 | `test_singleflight` | 100 并发同一 key 只回源 1 次、共享结果、无 inflight 泄漏、异常传播（leader 抛异常 → 等待者拿到异常而非死锁） |
 | `test_json` | 转义往返、控制字符 `\u00XX` 及高位码点 UTF-8 编解码、非法输入安全失败 |
 | `test_url` | 百分号编码/解码往返、特殊字符、非法序列原样保留 |
-| `test_node` | 单机本地命中 + 回源一次 + 空值缓存防穿透；极小 TTL(1/2/3ms) 边界；并发防击穿；双节点 HTTP 转发回填 |
+| `test_node` | 单机本地命中 + 回源一次 + 空值缓存防穿透；极小 TTL(1/2/3ms) 边界；并发防击穿；双节点 HTTP 转发回填；handler 抛异常→500 且进程存活；Stop→Start 重启可用；移除节点后 vnode 数不变；对端报错不写负缓存且映射为 503；发完立刻 FIN 仍能收到响应；超大 Content-Length 立即断开 |
 
 ## 设计要点
 

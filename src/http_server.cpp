@@ -8,8 +8,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 namespace dcache {
 
@@ -17,11 +19,19 @@ namespace {
 
 constexpr std::size_t kMaxRequestSize = 64 * 1024;
 
+// 单机允许同时挂起的连接上限。每个未完成的连接要占 64KB 读缓冲，
+// 不设上限时「开一堆连接只发半个请求」就能把节点内存吃干净。
+constexpr std::size_t kMaxConns = 8192;
+
+// 空闲连接回收阈值与扫描周期。
+constexpr int kIdleTimeoutMs  = 10000;
+constexpr int kSweepIntervalMs = 1000;
+
 // 阻塞写响应的最长等待时间。没有它，一个「只发请求不读响应」的客户端
 // 就能让 send() 永久阻塞，几个连接即可占满全部 worker（廉价 DoS）。
 constexpr int kSendTimeoutMs = 2000;
 
-// 解析请求；返回 1=完整，0=还需更多数据，-1=错误。
+// 解析请求；返回 1=完整，0=还需更多数据，-1=报文非法，-2=声明体过大。
 int parse_request(const std::string& data, HttpRequest& req) {
     const std::size_t hpos = data.find("\r\n\r\n");
     if (hpos == std::string::npos) {
@@ -69,6 +79,12 @@ int parse_request(const std::string& data, HttpRequest& req) {
         if (content_length < 0) {
             return -1; // 非法（负数）Content-Length
         }
+    }
+
+    // 声明体超过上限时立刻判失败：读缓冲本来就在 kMaxRequestSize 处封顶，
+    // 这种请求永远等不到「收全」，只会把这个连接永久挂在 conns_ 里。
+    if (static_cast<std::size_t>(content_length) > kMaxRequestSize) {
+        return -2;
     }
 
     const std::size_t total = hpos + 4 + static_cast<std::size_t>(content_length);
@@ -210,6 +226,9 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
     handler_ = std::move(handler);
     stop_ = false;
 
+    // 预留一个 fd，供 EMFILE 时自救（见 run()）。取不到不影响启动，只是少一层保护。
+    reserve_fd_ = ::open("/dev/null", O_RDONLY);
+
     // 复位关停标志与残留任务：Stop() 之后再 Start() 时，如果不复位 shutdown_，
     // 新建的工作线程会在第一次 wait 时立刻返回，此后所有请求进队列都无人消费。
     {
@@ -268,6 +287,8 @@ void HttpServer::run() {
     constexpr int kMaxEvents = 64;
     struct epoll_event events[kMaxEvents];
 
+    auto last_sweep = std::chrono::steady_clock::now();
+
     while (!stop_) {
         int n = ::epoll_wait(epoll_fd_, events, kMaxEvents, 100);
         if (n < 0) {
@@ -284,9 +305,40 @@ void HttpServer::run() {
                     socklen_t calen = sizeof(ca);
                     int cfd = ::accept(listen_fd_, reinterpret_cast<struct sockaddr*>(&ca), &calen);
                     if (cfd < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // backlog 已排空
+                        }
+                        if (errno == EMFILE || errno == ENFILE) {
+                            // fd 耗尽。此时不能简单 break：listen fd 在水平触发模式下
+                            // 始终可读，epoll_wait 会立刻返回，事件循环变成 100% CPU 空转
+                            // （最经典的 epoll 自旋 bug）。
+                            //
+                            // 而且此时 accept 本身就会失败，连「取走一个待处理连接」都做不到，
+                            // 所以必须先释放预留 fd 腾出名额，把连接取出来关掉，再把名额占回去。
+                            if (reserve_fd_ >= 0) {
+                                ::close(reserve_fd_);
+                                reserve_fd_ = -1;
+                                int drop = ::accept(listen_fd_, nullptr, nullptr);
+                                if (drop >= 0) {
+                                    ::close(drop);
+                                }
+                                reserve_fd_ = ::open("/dev/null", O_RDONLY);
+                            }
+                            if (reserve_fd_ < 0) {
+                                break; // 连预留 fd 都拿不回来，只能等下一轮
+                            }
+                            continue;
+                        }
+                        break; // ECONNABORTED 等，跳过这一个连接
                     }
+
+                    if (conns_.size() >= kMaxConns) {
+                        // 超过连接上限：不做无谓的排队，立刻拒绝，
+                        // 否则内存会被「开连接不发请求」的客户端拖垮。
+                        ::close(cfd);
+                        continue;
+                    }
+
                     set_nonblocking(cfd, true);
                     struct epoll_event cev;
                     std::memset(&cev, 0, sizeof(cev));
@@ -300,21 +352,27 @@ void HttpServer::run() {
                         if (::inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip)) != nullptr) {
                             conn.remote_ip = ip;
                         }
+                        conn.last_active = std::chrono::steady_clock::now();
                         conns_[cfd] = std::move(conn);
                     } else {
                         ::close(cfd);
                     }
                 }
-            } else if (ev & (EPOLLHUP | EPOLLERR)) {
-                if (conns_.find(fd) == conns_.end()) {
-                    continue; // fd 已移交给工作线程，忽略同批残留事件，避免重复 close
-                }
-                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                conns_.erase(fd);
-                ::close(fd);
             } else if (ev & EPOLLIN) {
+                // 必须先处理 EPOLLIN 再处理 HUP/ERR：
+                // 「发完请求立刻 close」的客户端会同时带回 EPOLLIN|EPOLLHUP，
+                // 若先走 HUP 分支直接关连接，缓冲区里那条完整请求就被丢掉了。
                 handle_read(fd);
+            } else if (ev & (EPOLLHUP | EPOLLERR)) {
+                close_conn(fd);
             }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_sweep).count() >=
+            kSweepIntervalMs) {
+            sweep_idle();
+            last_sweep = now;
         }
     }
 
@@ -324,8 +382,9 @@ void HttpServer::run() {
 void HttpServer::handle_read(int fd) {
     auto it = conns_.find(fd);
     if (it == conns_.end()) {
-        return;
+        return; // 已移交给工作线程，忽略同批残留事件
     }
+    it->second.last_active = std::chrono::steady_clock::now();
     std::string& buf = it->second.read_buf;
 
     char tmp[8192];
@@ -335,9 +394,7 @@ void HttpServer::handle_read(int fd) {
         if (n > 0) {
             buf.append(tmp, static_cast<std::size_t>(n));
             if (buf.size() > kMaxRequestSize) {
-                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                conns_.erase(fd);
-                ::close(fd);
+                close_conn(fd); // 报文超限，无需再读
                 return;
             }
         } else if (n == 0) {
@@ -353,7 +410,7 @@ void HttpServer::handle_read(int fd) {
     HttpRequest req;
     int rc = parse_request(buf, req);
     if (rc == 0 && !eof) {
-        return; // 等待更多数据
+        return; // 等待更多数据（空闲超时由 sweep_idle 兜底回收）
     }
 
     if (rc == 1) {
@@ -372,10 +429,10 @@ void HttpServer::handle_read(int fd) {
         return;
     }
 
-    // 请求不完整（连接提前关闭）或解析失败：直接关闭。
-    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-    conns_.erase(fd);
-    ::close(fd);
+    // 报文非法（-1）、声明体过大（-2）或连接已关闭但请求不完整：直接断开。
+    // 这里不做 400/413 回包——在事件循环线程上做阻塞写会拖慢整节点，
+    // 价值不如立刻释放资源。
+    close_conn(fd);
 }
 
 void HttpServer::handle_request(int fd, HttpRequest req) {
@@ -419,11 +476,43 @@ void HttpServer::worker_loop() {
     }
 }
 
+void HttpServer::close_conn(int fd) {
+    // 幂等：不在 conns_ 里说明 fd 已移交给工作线程，由工作线程负责关闭。
+    // 这样即使同一批事件里残留了该 fd 的 HUP，也不会误关别人复用的同号 fd。
+    if (conns_.erase(fd) == 0) {
+        return;
+    }
+    ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    ::close(fd);
+}
+
+void HttpServer::sweep_idle() {
+    const auto now = std::chrono::steady_clock::now();
+
+    // 先收集再关闭：erase 会让迭代器失效。
+    std::vector<int> victims;
+    for (const auto& kv : conns_) {
+        const auto idle_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - kv.second.last_active)
+                .count();
+        if (idle_ms >= kIdleTimeoutMs) {
+            victims.push_back(kv.first);
+        }
+    }
+    for (int fd : victims) {
+        close_conn(fd);
+    }
+}
+
 void HttpServer::cleanup() {
     for (auto& kv : conns_) {
         ::close(kv.first);
     }
     conns_.clear();
+    if (reserve_fd_ >= 0) {
+        ::close(reserve_fd_);
+        reserve_fd_ = -1;
+    }
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
