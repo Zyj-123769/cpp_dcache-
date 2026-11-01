@@ -169,13 +169,19 @@ do_fuzz() {
         return 0
     fi
 
+    # 必须先把目录建出来：下面的日志重定向 `> "$dir/configure.log"` 发生在 cmake
+    # 运行**之前**。目录不存在时 bash 连重定向都打不开，脚本会以 1 立即退出——
+    # 而且因为死在 cat 上（文件同样不存在），连 ::error:: 注解都来不及打，
+    # 在 CI 上表现为「一个 0 秒的红叉，什么信息都没有」。
+    mkdir -p "$dir"
+
     log "[fuzz] 配置"
     local cfg_log="$dir/configure.log"
     if ! cmake -S . -B "$dir" \
         -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DDCACHE_FUZZ=ON >"$cfg_log" 2>&1; then
-        cat "$cfg_log"
+        cat "$cfg_log" || true
         report error "fuzz 配置失败" "$(grep -iE 'error' "$cfg_log" | head -5)"
         return 1
     fi
@@ -186,7 +192,7 @@ do_fuzz() {
     local build_log="$dir/build.log"
     if ! cmake --build "$dir" -j "$JOBS" --target fuzz_json fuzz_url fuzz_http_request \
         >"$build_log" 2>&1; then
-        cat "$build_log"
+        cat "$build_log" || true
         # 编译错误同样只在日志里，而日志要 admin 权限——把关键几行打成注解。
         report error "fuzz 构建失败" "$(grep -E 'error:' "$build_log" | head -5)"
         return 1
@@ -209,7 +215,7 @@ do_fuzz() {
         # 输出落盘再回放：失败时要从中捞出崩溃原因，别指望人眼在几千行里找。
         local log_file="$dir/fuzz-${name}.log"
         if ! "$exe" -max_total_time="$FUZZ_SECONDS" -print_final_stats=1 "$corpus" >"$log_file" 2>&1; then
-            cat "$log_file"
+            cat "$log_file" || true
             echo "" >&2
             echo "fuzz 目标 fuzz_${name} 报告了崩溃或不变式失败。" >&2
             echo "崩溃样本已写到仓库根目录的 crash-*，复现方式：$exe crash-xxx" >&2
@@ -219,7 +225,7 @@ do_fuzz() {
         fi
         # 成功也留证据：只写「通过」而不说跑了多少次、覆盖了多少边，
         # 和「配了没跑」没有区别。cov/ft 就是 libFuzzer 自己报的边覆盖与特征数。
-        cat "$log_file"
+        cat "$log_file" || true
         report notice "fuzz-${name} 通过" "$(grep -E '^(Done|cov:)' "$log_file" | tail -2)"
     done
     return "$rc"
