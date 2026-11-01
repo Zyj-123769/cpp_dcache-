@@ -11,7 +11,6 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -135,7 +134,11 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
         std::string err;
         tls_ctx_ = tls::Context::CreateServer(tls_cfg, err);
         if (!tls_ctx_) {
-            std::fprintf(stderr, "[http] TLS 初始化失败: %s\n", err.c_str());
+            // 不用 fprintf：它是可变形参，clang-tidy 的
+            // cppcoreguidelines-pro-type-vararg 会直接拦下。写 stderr 的效果一样。
+            const std::string msg = "[http] TLS 初始化失败: " + err + "\n";
+            const ssize_t n       = ::write(STDERR_FILENO, msg.data(), msg.size());
+            (void)n;
             return false;
         }
         tls_enabled_ = true;

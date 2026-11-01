@@ -127,18 +127,41 @@ do_lint() {
         return 0
     fi
 
+    # 目录先建出来再写日志。上一轮的教训：`> log` 的重定向先于命令执行，
+    # 目录不存在时脚本会在「准备诊断」这一步静默退出。
+    mkdir -p build-lint
+    local fmt_log="build-lint/format.log"
+    local tidy_log="build-lint/tidy.log"
+
     log "[lint] 格式检查"
+    : > "$fmt_log"
     while IFS= read -r -d '' f; do
-        "$fmt" --dry-run --Werror "$f"
+        "$fmt" --dry-run --Werror "$f" >> "$fmt_log" 2>&1 || true
     done < <(find include src apps tests fuzz \
                   \( -name '*.hpp' -o -name '*.cpp' -o -name '*.tpp' \) -print0)
+
+    if [ -s "$fmt_log" ]; then
+        # 同样是「诊断不依赖权限」的理由：不把差异打出来，CI 只会留一个红叉。
+        report error "[lint] 格式不通过" "$(head -4 "$fmt_log" | tr '\n' ' ')"
+        return 1
+    fi
 
     log "[lint] 静态分析"
     cmake -S . -B build-lint -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >/dev/null
+
+    : > "$tidy_log"
+    local bad=0
     while IFS= read -r -d '' f; do
-        "$tidy" -p build-lint "$f"
+        "$tidy" -p build-lint "$f" >> "$tidy_log" 2>&1 || bad=1
     done < <(find src apps -name '*.cpp' -print0)
+
+    if [ "$bad" -ne 0 ]; then
+        local why
+        why="$(grep -E 'warning:|error:' "$tidy_log" | head -4 | tr '\n' ' ' || true)"
+        report error "[lint] 静态分析不通过" "${why:-clang-tidy 返回非零但没有可解析的诊断行}"
+        return 1
+    fi
 }
 
 do_coverage() {

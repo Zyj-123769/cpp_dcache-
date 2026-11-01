@@ -11,8 +11,8 @@
 
 #include <atomic>
 #include <cerrno>
-#include <cstddef>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -64,43 +64,64 @@ int connect_timeout(const std::string& host, std::uint16_t port, int timeout_ms)
         return -1;
     }
 
-    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
+    // 逐个尝试全部解析结果，而不是只用第一个。
+    // 只用第一个的后果很具体：多数 Linux 上 `localhost` 先解析到 ::1，
+    // 而节点监听的是 IPv4，于是「按域名连本机」直接失败，报错还只是「连不上」，
+    // 看不出是地址族选错了。所有候选共享同一个超时预算，避免 N 个地址把
+    // 一次转发的耗时翻成 N 倍。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    for (struct addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        if (left <= 0) {
+            break;
+        }
+
+        int fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        // 非阻塞 connect + poll，实现可控超时。
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        const int rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno != EINPROGRESS) {
+            ::close(fd);
+            continue;  // 这个地址不通，试下一个
+        }
+
+        if (rc < 0) {
+            struct pollfd pfd;
+            pfd.fd      = fd;
+            pfd.events  = POLLOUT;
+            pfd.revents = 0;
+            if (::poll(&pfd, 1, static_cast<int>(left)) <= 0) {
+                ::close(fd);
+                continue;
+            }
+        }
+
+        int so_error   = 0;
+        socklen_t slen = sizeof(so_error);
+        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen);
+        if (so_error != 0) {
+            ::close(fd);
+            continue;
+        }
+
+        ::fcntl(fd, F_SETFL, flags);  // 恢复阻塞
+        set_timeout(fd, timeout_ms, SO_RCVTIMEO);
+        set_timeout(fd, timeout_ms, SO_SNDTIMEO);
         ::freeaddrinfo(res);
-        return -1;
+        return fd;
     }
-
-    // 非阻塞 connect + poll，实现可控超时。
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-
-    int rc = ::connect(fd, res->ai_addr, res->ai_addrlen);
-    if (rc < 0 && errno != EINPROGRESS) {
-        ::close(fd);
-        ::freeaddrinfo(res);
-        return -1;
-    }
-
-    struct pollfd pfd;
-    pfd.fd     = fd;
-    pfd.events = POLLOUT;
-    int prc    = ::poll(&pfd, 1, timeout_ms);
-
-    int so_error   = 0;
-    socklen_t slen = sizeof(so_error);
-    ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen);
 
     ::freeaddrinfo(res);
-
-    if (prc <= 0 || so_error != 0) {
-        ::close(fd);
-        return -1;
-    }
-
-    ::fcntl(fd, F_SETFL, flags);  // 恢复阻塞
-    set_timeout(fd, timeout_ms, SO_RCVTIMEO);
-    set_timeout(fd, timeout_ms, SO_SNDTIMEO);
-    return fd;
+    return -1;
 }
 
 bool send_all(int fd, const char* data, std::size_t len) {

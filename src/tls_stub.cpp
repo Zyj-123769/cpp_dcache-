@@ -26,23 +26,32 @@ std::string Backend() {
 
 Context::~Context() {}
 
-std::unique_ptr<Context> Context::CreateServer(const ServerConfig&, std::string& err) {
+// 参数必须写名字：readability-named-parameter 会拦无名参数，
+// 而 -Wunused-parameter 又不许名字写了却不用，所以统一 (void) 掉。
+std::unique_ptr<Context> Context::CreateServer(const ServerConfig& cfg, std::string& err) {
+    (void)cfg;
     err = kUnavailable;
     return nullptr;
 }
 
-std::unique_ptr<Context> Context::CreateClient(const ClientConfig&, std::string& err) {
+std::unique_ptr<Context> Context::CreateClient(const ClientConfig& cfg, std::string& err) {
+    (void)cfg;
     err = kUnavailable;
     return nullptr;
 }
 
 Session::~Session() {}
 
-std::unique_ptr<Session> Session::Accept(Context&, int) {
+std::unique_ptr<Session> Session::Accept(Context& ctx, int fd) {
+    (void)ctx;
+    (void)fd;
     return nullptr;
 }
 
-std::unique_ptr<Session> Session::Connect(Context&, int, const std::string&) {
+std::unique_ptr<Session> Session::Connect(Context& ctx, int fd, const std::string& host) {
+    (void)ctx;
+    (void)fd;
+    (void)host;
     return nullptr;
 }
 
@@ -50,12 +59,16 @@ Step Session::Handshake() {
     return Step::kFailed;
 }
 
-long Session::Read(void*, std::size_t, Io& io) {
+long Session::Read(void* buf, std::size_t len, Io& io) {
+    (void)buf;
+    (void)len;
     io = Io::kFailed;
     return -1;
 }
 
-bool Session::WriteAll(const void*, std::size_t) {
+bool Session::WriteAll(const void* data, std::size_t len) {
+    (void)data;
+    (void)len;
     return false;
 }
 
