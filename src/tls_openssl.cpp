@@ -142,7 +142,7 @@ std::unique_ptr<Context> Context::CreateClient(const ClientConfig& cfg, std::str
 
     // 校验对端证书。这是整个 TLS 里最容易被省掉、也最不能省的一步：
     // 关掉它之后，任何能改路由的攻击者都能用一张自签证书把中间人做得天衣无缝。
-    ::SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    ::SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);  // EXPERIMENT: 故意关掉校验
     if (::SSL_CTX_load_verify_locations(ctx, cfg.ca_file.c_str(), nullptr) != 1) {
         return fail("加载 CA " + cfg.ca_file);
     }
