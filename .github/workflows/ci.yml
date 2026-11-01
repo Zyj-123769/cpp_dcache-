@@ -98,13 +98,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # runner 镜像里并不保证有 clang++（默认工具链是 gcc），显式装一次。
-      # 第一版忘了装，步骤在 `clang++ --version` 那一行就退了 —— 而且因为在脚本之前，
-      # 连注解都来不及打，只留下一个 6 秒的红叉。
-      - name: Install clang
+      # 镜像事实先写进注解再动手。原因：ubuntu-latest 自 2026-10 起逐步迁到 Ubuntu 26，
+      # 不同 runner 上装了什么并不一致，靠猜只会一轮一轮试。
+      # 这一步永远成功（全部 || true），失败信息以 notice 的形式带出来。
+      - name: Probe toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang
-          clang++ --version
+          {
+            echo "os=$(. /etc/os-release && echo "$PRETTY_NAME")"
+            echo "cmake=$(cmake --version 2>&1 | head -1)"
+            echo "gcc=$(g++ --version 2>&1 | head -1)"
+            echo "clang=$(clang++ --version 2>&1 | head -1)"
+            echo "bins=$(ls /usr/bin/clang* 2>/dev/null | head -3 | tr '\n' ' ')"
+          } | tee /tmp/probe.txt
+          echo "::notice title=probe::$(tr '\n' '|' < /tmp/probe.txt)"
+      - name: Ensure clang
+        run: |
+          if ! command -v clang++ >/dev/null 2>&1; then
+            sudo apt-get update || echo "APT UPDATE FAILED"
+            sudo apt-get install -y clang || echo "APT INSTALL FAILED"
+          fi
+          echo "::notice title=clang::$( (clang++ --version 2>&1 | head -1) || echo MISSING)"
       - name: Build & run fuzzers
         run: bash scripts/ci.sh fuzz
