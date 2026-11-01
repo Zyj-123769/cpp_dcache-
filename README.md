@@ -109,12 +109,12 @@ CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本�
 >
 > CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
-> **行覆盖率 78%**（2136 行中 1674 行，地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
+> **行覆盖率 79%**（2165 行中 1723 行，地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
 > **三个 libFuzzer 目标**（json / url / HTTP 请求行）按不变式断言跑，**首轮就撞出并修掉了
 > 一个 P0 级缺陷**：JSON 字段扫描不认字符串边界，值里出现 `"found"` 片段时会把「命中」读成「未命中」。
 > 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读；
 > fuzz 那一轮见第十三节，**节点间 TLS** 见第十四节。
-> 8 个测试二进制（含 6 组 TLS 用例，其中 3 组断言的是「必须失败」）。
+> 8 个测试二进制（含 7 组 TLS 用例，其中 3 组断言的是「必须失败」）。
 
 
 ### 单机演示
@@ -174,6 +174,30 @@ curl --cacert node.crt https://127.0.0.1:8001/api/scores/k1
 `-DDCACHE_TLS=OFF` 可以编出不带 OpenSSL 的版本；此时配了 TLS 参数会启动失败并说明原因，
 **不会静默退回明文**。
 
+### 证书热加载（SIGHUP）
+
+证书续期如果必须重启，重启就清空整个缓存——一次例行运维换来一次全量回源。
+所以换证书不需要重启：
+
+```bash
+# 1. 新证书就位。用 mv 而不是 cp：cp 会留下一段「文件写了一半」的窗口，
+#    而 reload 恰好可能在那时读到它（虽然失败也不会中断服务，但没必要多一次报警）
+mv new.crt node.crt && mv new.key node.key
+
+# 2. 通知进程重读（在途连接不受影响，只影响新连接）
+kill -HUP <pid>
+```
+
+行为边界写清楚，免得误判：
+
+- **失败不动旧证书**。文件写坏、路径写错、私钥与证书不匹配 → 重载失败，
+  继续用旧证书服务，`dcache_tls_reload_failures_total` +1。节点不会因为一次
+  错误的证书更新而停止服务。
+- **在途连接不受影响**。旧上下文靠 OpenSSL 的引用计数续命，等最后一个会话关闭
+  才真正释放；已建立的 keep-alive 连接可以跨过一次热加载继续用。
+- **会清空客户端连接池**。CA 换了就不该复用旧连接，代价是一次短暂的重连抖动。
+- **只换证书，不吊销**。没有 CRL/OCSP；证书泄露后仍需换一套证书再 reload。
+
 ### 监控指标
 
 `GET /metrics` 输出 Prometheus 文本格式，主要指标：
@@ -191,7 +215,9 @@ curl --cacert node.crt https://127.0.0.1:8001/api/scores/k1
 | `dcache_client_idle_connections` | gauge | 节点间转发的空闲连接数（复用是否生效） |
 | `dcache_hops_rejected_total` | counter | 带 `X-DCache-Hops` 但过不了校验的次数 —— **有人在伪造内部头** |
 | `dcache_tls_enabled` | gauge | 入站是否启用 TLS（1/0），一眼看出配置有没有生效 |
-| `dcache_tls_handshake_failures_total` | counter | TLS 握手失败数 —— 多半是**配置错误探测器**（对端没开 TLS / 证书过期 / CA 没同步） |
+| `dcache_tls_handshake_failures_total` | counter | **服务端**握手失败数。抓「对端根本不是 TLS」（明文打 TLS 口）和握手报文损坏；**抓不到「对端不信任我们的证书」**——TLS 1.3 下服务端发完 Finished 就成功了，那次失败只发生在客户端 |
+| `dcache_tls_reload_total` | counter | 证书热加载成功次数（SIGHUP） |
+| `dcache_tls_reload_failures_total` | counter | 热加载失败次数。**旧证书仍在服务**；持续增长说明有人在反复 reload 但文件始终不对 |
 
 其中 `requests_dropped_total` / `hops_rejected_total` / `tls_handshake_failures_total` 覆盖的都是
 「根本没进业务逻辑」的请求，只看访问日志是发现不了的。`tls_enabled` 尤其重要：
