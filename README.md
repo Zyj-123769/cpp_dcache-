@@ -109,8 +109,10 @@ CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本�
 > CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
 > **行覆盖率 79%**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
-> **三个 libFuzzer 目标**（json / url / HTTP 请求行）在不变式断言下无崩溃。
-> 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读。
+> **三个 libFuzzer 目标**（json / url / HTTP 请求行）按不变式断言跑，**首轮就撞出并修掉了
+> 一个 P0 级缺陷**：JSON 字段扫描不认字符串边界，值里出现 `"found"` 片段时会把「命中」读成「未命中」。
+> 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读；
+> fuzz 那一轮见第十三节。
 
 
 ### 单机演示
