@@ -141,9 +141,12 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
             (void)n;
             return false;
         }
+        // 留着配置：ReloadTls 要重新读同一组文件。
+        tls_cfg_     = tls_cfg;
         tls_enabled_ = true;
     } else {
         tls_ctx_.reset();
+        tls_cfg_     = tls::ServerConfig{};
         tls_enabled_ = false;
     }
 
@@ -238,6 +241,8 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
     responses_5xx_.store(0, std::memory_order_relaxed);
     active_conns_.store(0, std::memory_order_relaxed);
     handshake_failures_.store(0, std::memory_order_relaxed);
+    tls_reload_total_.store(0, std::memory_order_relaxed);
+    tls_reload_failures_.store(0, std::memory_order_relaxed);
 
     // 预留一个 fd，供 EMFILE 时自救（见 run()）。取不到不影响启动，只是少一层保护。
     reserve_fd_ = ::open("/dev/null", O_RDONLY);
@@ -264,15 +269,40 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
 
 HttpServer::Metrics HttpServer::GetMetrics() const {
     Metrics m;
-    m.requests_total     = requests_total_.load(std::memory_order_relaxed);
-    m.requests_dropped   = requests_dropped_.load(std::memory_order_relaxed);
-    m.responses_2xx      = responses_2xx_.load(std::memory_order_relaxed);
-    m.responses_4xx      = responses_4xx_.load(std::memory_order_relaxed);
-    m.responses_5xx      = responses_5xx_.load(std::memory_order_relaxed);
-    m.active_conns       = active_conns_.load(std::memory_order_relaxed);
-    m.handshake_failures = handshake_failures_.load(std::memory_order_relaxed);
-    m.tls_enabled        = tls_enabled_;
+    m.requests_total      = requests_total_.load(std::memory_order_relaxed);
+    m.requests_dropped    = requests_dropped_.load(std::memory_order_relaxed);
+    m.responses_2xx       = responses_2xx_.load(std::memory_order_relaxed);
+    m.responses_4xx       = responses_4xx_.load(std::memory_order_relaxed);
+    m.responses_5xx       = responses_5xx_.load(std::memory_order_relaxed);
+    m.active_conns        = active_conns_.load(std::memory_order_relaxed);
+    m.handshake_failures  = handshake_failures_.load(std::memory_order_relaxed);
+    m.tls_enabled         = tls_enabled_;
+    m.tls_reload_total    = tls_reload_total_.load(std::memory_order_relaxed);
+    m.tls_reload_failures = tls_reload_failures_.load(std::memory_order_relaxed);
     return m;
+}
+
+bool HttpServer::ReloadTls(std::string& err) {
+    if (!tls_enabled_) {
+        err = "未启用 TLS：明文监听的端口没有证书可加载";
+        return false;
+    }
+
+    // 先建后换。新上下文完全可用之后才替换 tls_ctx_ 指向的对象，
+    // 中途任何一步失败时 tls_ctx_ 一个字节都没动过——这是「reload 失败不影响
+    // 服务」的实现方式，而不是靠失败分支里去修复已经改坏的状态。
+    std::unique_ptr<tls::Context> fresh = tls::Context::CreateServer(tls_cfg_, err);
+    if (!fresh) {
+        tls_reload_failures_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // 旧上下文的释放时机交给 OpenSSL 的引用计数：SSL_new 时为 SSL_CTX 加了一次
+    // 引用，所以这里换掉 shared_ptr 只是减掉我们自己那一份，在途会话各自持有的
+    // 那一份仍然有效，连接不会被掐断。等最后一个会话关闭，旧上下文才真正释放。
+    std::atomic_store(&tls_ctx_, std::shared_ptr<tls::Context>(std::move(fresh)));
+    tls_reload_total_.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 void HttpServer::Stop() {
@@ -408,7 +438,11 @@ void HttpServer::run() {
                         conn.last_active = std::chrono::steady_clock::now();
 
                         if (tls_enabled_) {
-                            conn.ssl = tls::Session::Accept(*tls_ctx_, cfd);
+                            // 先取一份局部副本再建会话：reload 可能刚好在这两行之间
+                            // 换掉 tls_ctx_，局部 shared_ptr 保证我们用的是自洽的那份，
+                            // 而不是另一个线程刚减完引用、已经悬垂的上下文。
+                            const std::shared_ptr<tls::Context> ctx = std::atomic_load(&tls_ctx_);
+                            conn.ssl = ctx ? tls::Session::Accept(*ctx, cfd) : nullptr;
                             if (!conn.ssl) {
                                 // SSL_new 失败基本只有「内存耗尽」一种可能，
                                 // 但无论如何都不能把一条没有会话的连接留在表里。

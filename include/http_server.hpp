@@ -53,6 +53,17 @@ public:
     // 实际监听的端口（传入 0 时返回系统分配的端口）。
     std::uint16_t Port() const { return port_; }
 
+    // 热加载证书与私钥（配合 SIGHUP）。成功返回 true。
+    //
+    // 失败时**保留当前上下文**并返回 false（err 写原因）。这不是宽容，是唯一
+    // 正确的行为：证书文件被原地覆写时 reload 很可能读到半截 PEM；如果失败即
+    // 清空上下文，一次正常的证书更新就会把节点打成「所有握手都失败」。
+    // 正确表现是「继续用旧证书 + 失败计数涨 1 + 日志说明原因」。
+    //
+    // 任意线程可调。已建立的连接不受影响：SSL_new 会给 SSL_CTX 加一次引用，
+    // 旧上下文要等最后一个在途会话关闭后才真正释放。
+    bool ReloadTls(std::string& err);
+
     // 服务端指标快照。全部来自原子量，任意线程可安全读取。
     //
     // 为什么要单独统计而不是「让 handler 自己数」：handler 只看得见进入业务逻辑的请求，
@@ -70,6 +81,12 @@ public:
         // 挂在这里而不是 handler 里，是因为握手失败的连接根本到不了 handler。
         std::uint64_t handshake_failures = 0;
         bool tls_enabled                 = false;
+
+        // 证书热加载：成功次数与失败次数。
+        // 失败数持续涨而成功数不动，说明有人在一遍遍发 SIGHUP 但证书文件始终不对
+        // ——运维改了文件、忘了先校验，或者路径写到了另一个节点上。
+        std::uint64_t tls_reload_total    = 0;
+        std::uint64_t tls_reload_failures = 0;
     };
     Metrics GetMetrics() const;
 
@@ -154,7 +171,15 @@ private:
     // TLS 上下文（明文模式下为空）。必须比所有 Session 活得久：
     // Stop() 里先等事件循环与工作线程全部退出（那时所有 SSL 已释放），
     // 再由本对象析构释放 SSL_CTX。顺序反过来就是退出路径上的 use-after-free。
-    std::unique_ptr<tls::Context> tls_ctx_;
+    //
+    // 用 shared_ptr + atomic_load/store 而不是普通成员：ReloadTls 可能从别的
+    // 线程替换它，而事件循环每 accept 一次就要读。加一把锁等于让 accept 路径
+    // 付互斥代价；shared_ptr 的原子换在读侧只是一次原子加载，并且保证
+    // 「拿到手的那份不会被另一个线程同时释放」——换成裸指针就会有这个悬垂窗口。
+    std::shared_ptr<tls::Context> tls_ctx_;
+
+    // reload 要重新读同一组文件，所以配置必须留着（Start 时写一次，之后只读）。
+    tls::ServerConfig tls_cfg_;
     bool tls_enabled_ = false;
 
     // 事件循环线程专用：缓冲半包请求。
@@ -180,6 +205,8 @@ private:
     std::atomic<std::uint64_t> responses_5xx_{0};
     std::atomic<std::size_t> active_conns_{0};
     std::atomic<std::uint64_t> handshake_failures_{0};
+    std::atomic<std::uint64_t> tls_reload_total_{0};
+    std::atomic<std::uint64_t> tls_reload_failures_{0};
 };
 
 }  // namespace dcache

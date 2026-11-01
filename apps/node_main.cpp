@@ -22,8 +22,17 @@ namespace {
 
 std::atomic<bool> g_running{true};
 
+// SIGHUP 只置这个标志。信号处理器里能做的事极有限：malloc、锁、std::string
+// 都不保证 async-signal-safe，在里面读 PEM 文件等于随机死锁。
+// 真正的工作交给主循环（下面每 200ms 检查一次）。
+volatile std::sig_atomic_t g_reload_tls = 0;
+
 void on_signal(int) {
     g_running = false;
+}
+
+void on_sighup(int) {
+    g_reload_tls = 1;
 }
 
 std::vector<std::string> split(const std::string& s, char delim) {
@@ -175,6 +184,29 @@ bool parse_args(int argc, char** argv, Options& o) {
     return true;
 }
 
+// 一次 SIGHUP 对应两件事：服务端证书/私钥，和客户端信任的 CA。
+// 分开报告而不是合成一个「成功/失败」：证书换了但 CA 没换（或反过来）是真实
+// 存在的中间状态，合起来说会让运维看不出是哪一半没生效。
+void reload_tls(HttpServer& server, bool tls_in, const std::string& ca_file) {
+    if (tls_in) {
+        std::string err;
+        if (server.ReloadTls(err)) {
+            std::cout << "[node] SIGHUP: 服务端证书已重载\n";
+        } else {
+            std::cout << "[node] SIGHUP: 服务端证书重载失败（继续用旧证书）: " << err << "\n";
+        }
+    }
+
+    if (!ca_file.empty()) {
+        std::string err;
+        if (HttpClient::EnableTls(tls::ClientConfig{ca_file}, err)) {
+            std::cout << "[node] SIGHUP: 客户端 CA 已重载\n";
+        } else {
+            std::cout << "[node] SIGHUP: 客户端 CA 重载失败（继续用旧 CA）: " << err << "\n";
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -296,6 +328,16 @@ int main(int argc, char** argv) {
         out += "# HELP dcache_tls_enabled 入站是否启用 TLS（1/0）\n";
         out += "# TYPE dcache_tls_enabled gauge\n";
         out += std::string("dcache_tls_enabled ") + (m.tls_enabled ? "1\n" : "0\n");
+
+        out += "# HELP dcache_tls_reload_total 证书热加载成功次数\n";
+        out += "# TYPE dcache_tls_reload_total counter\n";
+        out += "dcache_tls_reload_total " + std::to_string(m.tls_reload_total) + "\n";
+
+        // 这条涨而 success 不涨，说明有人在反复发 SIGHUP 但证书文件始终不对：
+        // 改完没校验、路径写到了别的节点、或者覆盖时写成了半截文件。
+        out += "# HELP dcache_tls_reload_failures_total 证书热加载失败次数（旧证书仍在用）\n";
+        out += "# TYPE dcache_tls_reload_failures_total counter\n";
+        out += "dcache_tls_reload_failures_total " + std::to_string(m.tls_reload_failures) + "\n";
     });
 
     if (!server.Start(
@@ -308,16 +350,38 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
+    std::signal(SIGHUP, on_sighup);
 
     std::cout << "[node] listening on " << o.self << " group=" << o.group << " peers=" << o.peers
               << " auth=" << (o.token.empty() ? "off" : "token")
-              << " tls=" << (tls_in ? tls::Backend() : std::string("off")) << "\n";
+              << " tls=" << (tls_in ? tls::Backend() : std::string("off"));
+    if (tls_in) {
+        std::cout << " (SIGHUP 热加载证书)";
+    }
+    std::cout << "\n";
+
+    // 主循环按 200ms 步进，而不是直接 sleep(report_interval)：
+    // 那样一次 SIGHUP 要等到下一个统计周期才生效，默认 5 秒。
+    // 拆成小步的代价是每 200ms 一次空转判断，可以忽略。
+    constexpr int kTickMs = 200;
+    int elapsed_ms        = 0;
+    const int report_ms   = o.report_interval * 1000;
 
     while (g_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(o.report_interval));
+        std::this_thread::sleep_for(std::chrono::milliseconds(kTickMs));
+        elapsed_ms += kTickMs;
         if (!g_running)
             break;
-        std::cout << "[node] stats=" << node.DumpStats() << "\n";
+
+        if (g_reload_tls != 0) {
+            g_reload_tls = 0;
+            reload_tls(server, tls_in, o.tls_ca);
+        }
+
+        if (elapsed_ms >= report_ms) {
+            elapsed_ms = 0;
+            std::cout << "[node] stats=" << node.DumpStats() << "\n";
+        }
     }
 
     server.Stop();

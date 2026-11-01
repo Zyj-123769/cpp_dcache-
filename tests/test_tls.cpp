@@ -3,6 +3,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <sys/socket.h>
@@ -253,6 +254,161 @@ std::string raw_exchange(std::uint16_t port, const std::string& request) {
     return out;
 }
 
+std::string read_file(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        return std::string();
+    }
+    std::string out;
+    char buf[4096];
+    std::size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+    }
+    std::fclose(f);
+    return out;
+}
+
+// 最小 TLS 客户端，**只用于测量**服务端此刻发的是哪张证书。
+//
+// 刻意 SSL_VERIFY_NONE：这里要证明的是「轮换生效了」，一旦开启校验，
+// 「换成新证书后旧 CA 连不上」会先让连接断开，反而看不到新证书是谁。
+// 这是测量工具，不是产品路径 —— 产品路径在 HttpClient 里，那里强制校验，
+// 且有一条专门的用例证明它在错误的 CA 下必须失败。
+class TlsProbe {
+public:
+    TlsProbe() = default;
+    ~TlsProbe() { close(); }
+    TlsProbe(const TlsProbe&)            = delete;
+    TlsProbe& operator=(const TlsProbe&) = delete;
+
+    bool open(std::uint16_t port) {
+        close();
+        ctx_ = ::SSL_CTX_new(::TLS_client_method());
+        if (ctx_ == nullptr) {
+            return false;
+        }
+        ::SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
+
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) {
+            return false;
+        }
+        struct timeval tv;
+        tv.tv_sec  = 3;
+        tv.tv_usec = 0;
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in sin;
+        std::memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_port   = htons(port);
+        if (::inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr) != 1 ||
+            ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) != 0) {
+            return false;
+        }
+
+        ssl_ = ::SSL_new(ctx_);
+        if (ssl_ == nullptr) {
+            return false;
+        }
+        if (::SSL_set_fd(ssl_, fd_) != 1) {
+            return false;
+        }
+        return ::SSL_connect(ssl_) == 1;
+    }
+
+    // 读对端证书的 CN。用 CN 而不是序列号：序列号在自签证书里不可控，
+    // 而 make_self_signed 的 CN 是调用方给的常量，能当身份标签用。
+    std::string peer_cn() {
+        if (ssl_ == nullptr) {
+            return std::string();
+        }
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        X509* peer = ::SSL_get1_peer_certificate(ssl_);
+#else
+        X509* peer = ::SSL_get_peer_certificate(ssl_);
+#endif
+        if (peer == nullptr) {
+            return std::string();
+        }
+        char buf[256] = {0};
+        ::X509_NAME_get_text_by_NID(::X509_get_subject_name(peer), NID_commonName, buf,
+                                    sizeof(buf));
+        ::X509_free(peer);
+        return std::string(buf);
+    }
+
+    bool send(const std::string& req) {
+        if (ssl_ == nullptr) {
+            return false;
+        }
+        std::size_t off = 0;
+        while (off < req.size()) {
+            const int n = ::SSL_write(ssl_, req.data() + off, static_cast<int>(req.size() - off));
+            if (n <= 0) {
+                return false;
+            }
+            off += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+
+    // 读且只读一个完整响应（按 Content-Length）。本项目的服务端不用 chunked，
+    // 这里跟着它的契约走，比写一个通用实现少一半代码、也少一半出错机会。
+    std::string read_one() {
+        std::string buf;
+        if (ssl_ == nullptr) {
+            return buf;
+        }
+        char tmp[2048];
+        std::size_t header_end = std::string::npos;
+        std::size_t want       = 0;
+        for (;;) {
+            if (header_end == std::string::npos) {
+                header_end = buf.find("\r\n\r\n");
+                if (header_end != std::string::npos) {
+                    header_end += 4;
+                    const std::string key = "Content-Length:";
+                    const std::size_t p   = buf.find(key);
+                    if (p != std::string::npos && p < header_end) {
+                        want = static_cast<std::size_t>(std::atoi(buf.c_str() + p + key.size()));
+                    }
+                }
+            }
+            if (header_end != std::string::npos && buf.size() >= header_end + want) {
+                return buf;
+            }
+            const int n = ::SSL_read(ssl_, tmp, sizeof(tmp));
+            if (n <= 0) {
+                return buf;
+            }
+            buf.append(tmp, static_cast<std::size_t>(n));
+        }
+    }
+
+private:
+    void close() {
+        if (ssl_ != nullptr) {
+            ::SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        if (ctx_ != nullptr) {
+            ::SSL_CTX_free(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    SSL_CTX* ctx_ = nullptr;
+    SSL* ssl_     = nullptr;
+    int fd_       = -1;
+};
+
 void ok_handler(const HttpRequest& req, HttpResponse& resp) {
     resp.status = 200;
     resp.body   = "tls:" + req.path;
@@ -458,6 +614,102 @@ int main() {
         sA.Stop();
         sB.Stop();
         HttpClient::CloseIdleConnections();
+    }
+
+    // ---- 7. 证书热加载：换证书不重启、失败不中断 ----
+    // 这组用例要证明三件事，缺一件热加载就不成立：
+    //   a) 换文件 + reload 之后，新连接拿到的是新证书；
+    //   b) reload 之前建立的连接**继续可用**（旧上下文由 OpenSSL 引用计数续命）；
+    //   c) reload 失败时旧证书仍在服务，节点不被打挂。
+    // 第 c 条尤其重要：运维覆盖文件时读到半截 PEM 是常态，那不该是一次事故。
+    {
+        CertFiles gen_a{};
+        CertFiles gen_b{};
+        CHECK(make_self_signed("reload-a", true, gen_a));
+        CHECK(make_self_signed("reload-b", true, gen_b));
+
+        // 服务端只认这两个固定路径，内容稍后原地覆盖 —— 这正是运维的常规做法
+        // （cp/mv 到同一路径，再发 SIGHUP）。
+        CertFiles live{};
+        live.cert_path = temp_path();
+        live.key_path  = temp_path();
+        CHECK(!live.cert_path.empty() && !live.key_path.empty());
+        CHECK(write_file(live.cert_path, read_file(gen_a.cert_path)));
+        CHECK(write_file(live.key_path, read_file(gen_a.key_path)));
+
+        tls::ServerConfig sc;
+        sc.cert_file = live.cert_path;
+        sc.key_file  = live.key_path;
+
+        HttpServer s;
+        CHECK(s.Start("127.0.0.1", 0, ok_handler, 4, sc));
+        CHECK(s.GetMetrics().tls_enabled);
+
+        // 7.1 当前发的是 A
+        {
+            TlsProbe p;
+            CHECK(p.open(s.Port()));
+            CHECK(p.peer_cn() == "reload-a");
+        }
+
+        // 7.2 先建一条 keep-alive 连接，reload 之后要在这条老连接上再发请求
+        TlsProbe live_conn;
+        CHECK(live_conn.open(s.Port()));
+        CHECK(live_conn.send("GET /before HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n"));
+        CHECK(live_conn.read_one().find("tls:/before") != std::string::npos);
+
+        // 7.3 原地覆盖成 B，然后 reload
+        CHECK(write_file(live.cert_path, read_file(gen_b.cert_path)));
+        CHECK(write_file(live.key_path, read_file(gen_b.key_path)));
+        std::string err;
+        CHECK(s.ReloadTls(err));
+        CHECK(s.GetMetrics().tls_reload_total == 1);
+        CHECK(s.GetMetrics().tls_reload_failures == 0);
+
+        // 7.4 新连接看到的是 B —— 这是「轮换真的生效」的唯一直接证据
+        {
+            TlsProbe p;
+            CHECK(p.open(s.Port()));
+            CHECK(p.peer_cn() == "reload-b");
+        }
+
+        // 7.5 reload 之前的老连接仍然能跑完第二个请求。
+        // 如果实现里直接 SSL_CTX_free 掉旧上下文，这里会是空响应或连接被掐。
+        // 顺带：这条用例在 ASan 下也是「SSL_new 会给 SSL_CTX 加引用」这个
+        // 前提的验证 —— 假设不成立时这里就是一处 use-after-free。
+        CHECK(live_conn.send("GET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));
+        CHECK(live_conn.read_one().find("tls:/after") != std::string::npos);
+
+        // 7.6 证书写成半截：reload 必须失败，且旧证书继续服务
+        CHECK(write_file(live.cert_path, "-----BEGIN CERTIFICATE-----\nnot-a-cert\n"));
+        CHECK(!s.ReloadTls(err));
+        CHECK(!err.empty());
+        CHECK(s.GetMetrics().tls_reload_failures == 1);
+        CHECK(s.GetMetrics().tls_reload_total == 1);  // 失败不能计入成功
+        {
+            TlsProbe p;
+            CHECK(p.open(s.Port()));  // 服务没被打挂
+            CHECK(p.peer_cn() == "reload-b");
+        }
+
+        // 7.7 修好文件后能恢复，说明失败不是「把上下文弄坏了」而是「没动它」
+        CHECK(write_file(live.cert_path, read_file(gen_a.cert_path)));
+        CHECK(write_file(live.key_path, read_file(gen_a.key_path)));
+        CHECK(s.ReloadTls(err));
+        CHECK(s.GetMetrics().tls_reload_total == 2);
+        {
+            TlsProbe p;
+            CHECK(p.open(s.Port()));
+            CHECK(p.peer_cn() == "reload-a");
+        }
+
+        // 全程不该出现握手失败：热加载只换证书，不该影响任何一次握手。
+        CHECK(s.GetMetrics().handshake_failures == 0);
+
+        s.Stop();
+        remove_files(live);
+        remove_files(gen_a);
+        remove_files(gen_b);
     }
 
     remove_files(good);
