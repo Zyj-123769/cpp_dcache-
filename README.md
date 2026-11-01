@@ -1,5 +1,7 @@
 # 04. 分布式缓存（C++）
 
+[![CI](https://github.com/Zyj-123769/cpp_dcache-/actions/workflows/ci.yml/badge.svg)](https://github.com/Zyj-123769/cpp_dcache-/actions/workflows/ci.yml)
+
 对标 Go 版 groupcache / GeeCache 的 C++ 实现：**线程安全 LRU 本地缓存 + 一致性哈希路由 + HTTP 网关 + singleflight 防击穿**。
 
 在单机 LRU 缓存之上叠加一致性哈希节点路由与 HTTP 网关，实现「本地命中即返回、未命中按哈希转发到负责节点并回填」的多节点分布式缓存。
@@ -96,8 +98,13 @@ bash scripts/ci.sh all     # build -> asan -> tsan -> lint
 CI（`.github/workflows/ci.yml`）的四个 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
 除了平台差异（Linux vs Windows）之外，两边不会有第二套命令。
 
-> 注：本仓库主仓在 Gitee，但 Gitee 不执行 `.github/workflows/`，CI 实际生效需要推到 GitHub
-> 或接入外部流水线，详见 `docs/CODE_REVIEW_GUIDE.md` 第 6 节。
+> 双远端：GitHub 为主仓（CI 跑在这里），Gitee 为国内镜像。
+> Gitee 不执行 `.github/workflows/`（Gitee Go 需企业版且自定义 shell 要自备 Linux 主机），
+> 所以门禁只在 GitHub 生效，详见 `docs/CODE_REVIEW_GUIDE.md` 第 6 节。
+>
+> CI 状态：四个 job（build / asan+ubsan / tsan / lint）已全部实跑通过。
+> ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff。首跑记录见
+> `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读。
 
 
 ### 单机演示

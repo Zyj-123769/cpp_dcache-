@@ -8,48 +8,25 @@ on:
 # 构建命令全部收在 scripts/ci.sh 里，这里只声明「在哪个 runner 上跑哪一项」。
 # 换 CI 平台时（Gitee Go / 云效 / Jenkins），改的是这一层的方言，脚本不动。
 
-# 默认的 GITHUB_TOKEN 是只读的，失败日志推不上去（publish 步骤会 fail 而不是 skip，
-# 容易误以为日志已经发布了）。缺省权限一律显式声明。
+# 最小权限：CI 只需要读仓库。默认 token 的权限随仓库设置变化，
+# 显式声明才能保证「在别的仓库里复制这份配置」时行为一致。
 permissions:
-  contents: write
+  contents: read
 
-# 【临时诊断开关】失败时把完整日志推到 ci-log-<job> 分支。
-# 起因：日志下载接口要求仓库 admin 权限，协作者（以及需要离线排查的人）
-# 拿不到失败现场，只能看到一个红叉。修完之后可以删掉 publish-log 步骤。
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build & test
-        run: |
-          set -o pipefail
-          bash scripts/ci.sh build 2>&1 | tee "ci-${{ github.job }}.log"
-      - name: Publish log on failure
-        if: failure()
-        run: |
-          git config user.name  ci-bot
-          git config user.email ci-bot@users.noreply.github.com
-          git add -f "ci-${{ github.job }}.log"
-          git commit -m "ci log: ${{ github.job }} @ ${{ github.sha }}"
-          git push -f origin "HEAD:refs/heads/ci-log-${{ github.job }}"
+        run: bash scripts/ci.sh build
 
   sanitizers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build & test (ASan/UBSan)
-        run: |
-          set -o pipefail
-          bash scripts/ci.sh asan 2>&1 | tee "ci-${{ github.job }}.log"
-      - name: Publish log on failure
-        if: failure()
-        run: |
-          git config user.name  ci-bot
-          git config user.email ci-bot@users.noreply.github.com
-          git add -f "ci-${{ github.job }}.log"
-          git commit -m "ci log: ${{ github.job }} @ ${{ github.sha }}"
-          git push -f origin "HEAD:refs/heads/ci-log-${{ github.job }}"
+        run: bash scripts/ci.sh asan
 
   # 并发代码必须有 TSan 关卡：ASan 查不出数据竞争。
   tsan:
@@ -57,17 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build & test (TSan)
-        run: |
-          set -o pipefail
-          bash scripts/ci.sh tsan 2>&1 | tee "ci-${{ github.job }}.log"
-      - name: Publish log on failure
-        if: failure()
-        run: |
-          git config user.name  ci-bot
-          git config user.email ci-bot@users.noreply.github.com
-          git add -f "ci-${{ github.job }}.log"
-          git commit -m "ci log: ${{ github.job }} @ ${{ github.sha }}"
-          git push -f origin "HEAD:refs/heads/ci-log-${{ github.job }}"
+        run: bash scripts/ci.sh tsan
 
   lint:
     runs-on: ubuntu-latest
@@ -84,14 +51,4 @@ jobs:
           # pip --user 装到 ~/.local/bin，该目录默认不在 runner 的 PATH 里。
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Format & static analysis
-        run: |
-          set -o pipefail
-          bash scripts/ci.sh lint 2>&1 | tee "ci-${{ github.job }}.log"
-      - name: Publish log on failure
-        if: failure()
-        run: |
-          git config user.name  ci-bot
-          git config user.email ci-bot@users.noreply.github.com
-          git add -f "ci-${{ github.job }}.log"
-          git commit -m "ci log: ${{ github.job }} @ ${{ github.sha }}"
-          git push -f origin "HEAD:refs/heads/ci-log-${{ github.job }}"
+        run: bash scripts/ci.sh lint
