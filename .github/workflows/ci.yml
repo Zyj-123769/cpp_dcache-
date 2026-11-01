@@ -70,14 +70,18 @@ jobs:
       - name: Coverage summary
         if: always()
         run: |
-          if [ -f build-cov/coverage.txt ]; then
-            {
-              echo "### 行覆盖率（src/ + include/）"
-              echo ''
-              echo '```'
-              cat build-cov/coverage.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
+          if [ ! -f build-cov/coverage.txt ]; then
             echo "没有生成 build-cov/coverage.txt（构建或 gcovr 阶段就失败了）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+          {
+            echo "### 行覆盖率（src/ + include/）"
+            echo ''
+            echo '```'
+            cat build-cov/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 再把 TOTAL 行做成一条注解。注解是唯一能用匿名 API 读到的产物：
+          #   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
+          # 日志接口要 admin 权限，页面又要人肉看——数字要能被机器取走才算可观测。
+          echo "::notice title=行覆盖率::$(grep '^TOTAL' build-cov/coverage.txt | tail -1)"
