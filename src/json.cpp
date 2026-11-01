@@ -13,25 +13,48 @@ void append_hex_escape(std::string& out, unsigned char c) {
 }
 
 // 定位 "key" 字段，并让 pos 指向其值的起始位置（跳过冒号与空白）。
+//
+// 关键约束：**必须跳过字符串字面量内部**。
+// 早期版本用 `body.find(needle)` 直接搜，命中的可能是值内部的一段文本：
+// 缓存值本身是 `a"found` 时，编码出来是 "a\"found"，其中就含 `"found"` 这个片段。
+// 于是 JsonFindBool 以为找到了 found 字段，读到的却是值里的内容 ——
+// 轻则「自己编码的报文自己读不回来」（返回 false 直接判畸形），
+// 重则悄悄把「命中」读成「未命中」（值的构造足够巧时，后面真能跟一个 :false）。
+// 这条是 fuzz 上线 30 秒撞出来的，人工用例和四批 review 都没看见。
 bool find_after_key(const std::string& body, const std::string& key, std::size_t& p) {
     const std::string needle = "\"" + key + "\"";
-    std::size_t pos          = body.find(needle);
-    if (pos == std::string::npos) {
-        return false;
+    bool in_string           = false;
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        const char c = body[i];
+        if (in_string) {
+            if (c == '\\') {
+                ++i;  // 跳过被转义的下一个字符：\" 不是字符串结束
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c != '"') {
+            continue;
+        }
+        // 顶层的引号：要么是目标字段名，要么是一段与本次查找无关的字符串。
+        if (body.compare(i, needle.size(), needle) == 0) {
+            std::size_t q = i + needle.size();
+            while (q < body.size() && (body[q] == ' ' || body[q] == '\t')) {
+                ++q;
+            }
+            if (q < body.size() && body[q] == ':') {
+                ++q;
+                while (q < body.size() && (body[q] == ' ' || body[q] == '\t')) {
+                    ++q;
+                }
+                p = q;
+                return true;
+            }
+        }
+        in_string = true;
     }
-    pos += needle.size();
-    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
-        ++pos;
-    }
-    if (pos >= body.size() || body[pos] != ':') {
-        return false;
-    }
-    ++pos;
-    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
-        ++pos;
-    }
-    p = pos;
-    return true;
+    return false;
 }
 
 int hex_digit(char c) {
