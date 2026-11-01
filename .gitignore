@@ -1,0 +1,25 @@
+# 构建产物
+build/
+bin/
+*.o
+*.obj
+*.exe
+*.out
+
+# 根目录生成的二进制（Makefile 直接输出到仓库根目录）
+/node
+/bench
+/test_*
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.user
+
+# 缓存与工具输出
+__pycache__/
+*.log
+
+# 本地 Agent 状态（工作记忆 / 会话缓存），不入库
+.workbuddy/

@@ -1,0 +1,13 @@
+# 统一换行符，避免 Windows 开发 + Linux 构建/CI 之间的 CRLF 污染。
+#
+# 本项目依赖 epoll，生产与 CI 都在 Linux 上跑；源码里混入 CRLF 会让
+# 补丁出现整文件 diff，也可能破坏 shebang / 行尾敏感脚本。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
