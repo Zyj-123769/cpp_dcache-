@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +28,22 @@ namespace {
 // 就能把调用方节点的内存吃干净——节点间转发是内部接口，但内部接口也会出故障。
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes   = 8 * 1024 * 1024;
+
+// TLS 的全局上下文。
+//
+// 为什么用 shared_ptr + atomic_load/store 而不是一把锁：Get 在转发热路径上，
+// 每请求都要判断「这次走不走 TLS」，加锁等于给所有转发串行化。
+// 这和 peer_pool 换哈希环用的是同一套写法——读侧拿快照，写侧换指针，
+// 已经取到旧快照的线程继续安全用到它用完为止。
+std::shared_ptr<tls::Context> g_tls_ctx;
+
+std::shared_ptr<tls::Context> TlsContext() {
+    return std::atomic_load(&g_tls_ctx);
+}
+
+// 阻塞 fd 上重试 TLS WANT_* 的上限。阻塞 fd 上每重试一次都要等一个
+// SO_RCVTIMEO 周期，所以循环本身已经是有界的；上限只是保证「绝不无限循环」。
+constexpr int kMaxIoSpins = 8;
 
 bool set_timeout(int fd, int ms, int optname) {
     struct timeval tv;
@@ -99,10 +116,110 @@ bool send_all(int fd, const char* data, std::size_t len) {
     return true;
 }
 
+// ---------------- TLS 辅助 ----------------
+
+// 一次读的结果。kError 与 kEof 在上层都要收尾，但语义不同：
+// 前者是「连接坏了」（超时/握手后的协议错误），后者是「对端正常收尾」。
+enum class ReadOutcome { kData, kEof, kError };
+
+// 统一的一次读：有 TLS 会话就走 SSL，否则走裸 recv。
+ReadOutcome conn_read(int fd, tls::Session* ssl, char* buf, std::size_t len, std::size_t& got) {
+    got = 0;
+
+    if (ssl == nullptr) {
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, len, 0);
+            if (n > 0) {
+                got = static_cast<std::size_t>(n);
+                return ReadOutcome::kData;
+            }
+            if (n == 0) {
+                return ReadOutcome::kEof;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            return ReadOutcome::kError;
+        }
+    }
+
+    for (int spins = 0; spins < kMaxIoSpins; ++spins) {
+        tls::Io io   = tls::Io::kOk;
+        const long n = ssl->Read(buf, len, io);
+        if (n > 0) {
+            got = static_cast<std::size_t>(n);
+            return ReadOutcome::kData;
+        }
+        if (io == tls::Io::kClosed) {
+            return ReadOutcome::kEof;
+        }
+        if (io == tls::Io::kWantRead || io == tls::Io::kWantWrite) {
+            // fd 是阻塞的：这里再调一次 SSL_read 会阻塞到数据到达或超时，
+            // 所以「重试」不会变成忙等。
+            continue;
+        }
+        return ReadOutcome::kError;
+    }
+    return ReadOutcome::kError;
+}
+
+bool conn_send(int fd, tls::Session* ssl, const char* data, std::size_t len) {
+    if (ssl != nullptr) {
+        return ssl->WriteAll(data, len);
+    }
+    return send_all(fd, data, len);
+}
+
+// 在给定预算内完成客户端侧握手。
+//
+// 为什么不直接靠阻塞 fd 上的 SO_RCVTIMEO：一次握手要来回好几趟，每趟都可能等满
+// 一个超时周期，最坏情况是「超时 × 往返数」，一个不响应的对端能把一次转发拖成十几秒。
+// 这里临时切非阻塞 + poll 并显式算 deadline，让握手耗时等于调用方给的 timeout。
+bool do_handshake(int fd, tls::Session& ssl, int timeout_ms) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return false;
+    }
+
+    bool ok             = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    for (;;) {
+        const tls::Step st = ssl.Handshake();
+        if (st == tls::Step::kOk) {
+            ok = true;
+            break;
+        }
+        if (st == tls::Step::kFailed) {
+            break;
+        }
+
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - std::chrono::steady_clock::now())
+                              .count();
+        if (left <= 0) {
+            break;
+        }
+
+        struct pollfd pfd;
+        pfd.fd      = fd;
+        pfd.events  = (st == tls::Step::kWantWrite) ? POLLOUT : POLLIN;
+        pfd.revents = 0;
+        if (::poll(&pfd, 1, static_cast<int>(left)) <= 0) {
+            break;  // 超时或被信号打断：都不再重试
+        }
+    }
+
+    // 恢复阻塞模式：后面的 SSL_read / SSL_write 依赖 SO_RCVTIMEO 来限时。
+    ::fcntl(fd, F_SETFL, flags);
+    return ok;
+}
+
 // 读入响应头（以 \r\n\r\n 结束）。
 // peer_closed：还没读到任何头字节，对端就发来了 FIN。这是「复用了一条已经被
 // 对端回收的连接」的典型特征，调用方据此决定是否换新连接重试。
-bool read_headers(int fd, std::string& buf, std::size_t& header_end, bool& peer_closed) {
+bool read_headers(int fd, tls::Session* ssl, std::string& buf, std::size_t& header_end,
+                  bool& peer_closed) {
     peer_closed = false;
     char tmp[4096];
     for (;;) {
@@ -114,8 +231,10 @@ bool read_headers(int fd, std::string& buf, std::size_t& header_end, bool& peer_
         if (buf.size() > kMaxHeaderBytes) {
             return false;  // 响应头超限：对端可能根本不打算结束头部
         }
-        ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-        if (n == 0) {
+
+        std::size_t got     = 0;
+        const ReadOutcome r = conn_read(fd, ssl, tmp, sizeof(tmp), got);
+        if (r == ReadOutcome::kEof) {
             // 连接被关闭但可能已经收到完整头。
             std::size_t pos2 = buf.find("\r\n\r\n");
             if (pos2 != std::string::npos) {
@@ -125,12 +244,10 @@ bool read_headers(int fd, std::string& buf, std::size_t& header_end, bool& peer_
             peer_closed = buf.empty();
             return false;
         }
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
+        if (r == ReadOutcome::kError) {
             return false;
         }
-        buf.append(tmp, static_cast<std::size_t>(n));
+        buf.append(tmp, got);
     }
 }
 
@@ -199,6 +316,9 @@ std::atomic<bool> g_keep_alive{true};
 
 struct IdleConn {
     int fd = -1;
+    // TLS 会话（明文模式下为 nullptr）。会话必须跟连接一起进出池子：
+    // 把 SSL 丢掉、只留 fd，等于让下一条请求在一条已握手的连接上发明文。
+    std::unique_ptr<tls::Session> ssl;
     std::chrono::steady_clock::time_point since;
 };
 
@@ -209,47 +329,47 @@ public:
         return pool;
     }
 
-    // 取一条可用连接；没有则返回 -1。
-    int Take(const std::string& key) {
+    // 取一条可用连接；没有则返回 fd == -1。
+    IdleConn Take(const std::string& key) {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = idle_.find(key);
         if (it == idle_.end()) {
-            return -1;
+            return IdleConn{};
         }
 
         std::vector<IdleConn>& list = it->second;
         const auto now              = std::chrono::steady_clock::now();
-        int fd                      = -1;
         while (!list.empty()) {
-            const IdleConn c = list.back();
+            IdleConn c = std::move(list.back());
             list.pop_back();
             --total_;
             if (IdleAgeMs(now, c.since) < kIdleTtlMs) {
-                fd = c.fd;
-                break;
+                if (list.empty()) {
+                    idle_.erase(it);
+                }
+                return c;
             }
             ::close(c.fd);  // 超时未用：服务端多半已回收，不能拿来当活连接
         }
-        if (list.empty()) {
-            idle_.erase(it);
-        }
-        return fd;
+        idle_.erase(it);
+        return IdleConn{};
     }
 
-    void Put(const std::string& key, int fd) {
+    void Put(const std::string& key, IdleConn conn) {
         std::lock_guard<std::mutex> lk(mtx_);
         PurgeLocked();
 
         if (total_ >= kMaxIdleTotal) {
-            ::close(fd);
+            ::close(conn.fd);
             return;
         }
         std::vector<IdleConn>& list = idle_[key];
         if (list.size() >= kMaxIdlePerHost) {
-            ::close(fd);
+            ::close(conn.fd);
             return;
         }
-        list.push_back(IdleConn{fd, std::chrono::steady_clock::now()});
+        conn.since = std::chrono::steady_clock::now();
+        list.push_back(std::move(conn));
         ++total_;
     }
 
@@ -311,7 +431,7 @@ enum class ExchangeResult {
 
 // 在一条已建立的连接上完成一次「请求 - 响应」。
 // keep_alive 出参：响应完整且对端同意复用，这条连接可以收回池子。
-ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
+ExchangeResult do_exchange(int fd, tls::Session* ssl, const std::string& host, std::uint16_t port,
                            const std::string& path, int timeout_ms,
                            const std::map<std::string, std::string>& extra_headers,
                            int* http_status, std::string& out, bool& keep_alive) {
@@ -325,14 +445,14 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
     }
     req += "Connection: keep-alive\r\n\r\n";
 
-    if (!send_all(fd, req.data(), req.size())) {
+    if (!conn_send(fd, ssl, req.data(), req.size())) {
         return ExchangeResult::kFailed;
     }
 
     std::string buf;
     std::size_t header_end = 0;
     bool peer_closed       = false;
-    if (!read_headers(fd, buf, header_end, peer_closed)) {
+    if (!read_headers(fd, ssl, buf, header_end, peer_closed)) {
         return peer_closed ? ExchangeResult::kStaleConn : ExchangeResult::kFailed;
     }
 
@@ -370,15 +490,15 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
 
         char tmp[4096];
         while (body.size() < want) {
-            ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n == 0)
-                break;
-            if (n < 0) {
-                if (errno == EINTR)
-                    continue;
+            std::size_t got     = 0;
+            const ReadOutcome r = conn_read(fd, ssl, tmp, sizeof(tmp), got);
+            if (r == ReadOutcome::kEof) {
                 break;
             }
-            body.append(tmp, static_cast<std::size_t>(n));
+            if (r == ReadOutcome::kError) {
+                break;
+            }
+            body.append(tmp, got);
             if (body.size() > kMaxBodyBytes) {
                 return ExchangeResult::kFailed;
             }
@@ -400,15 +520,12 @@ ExchangeResult do_exchange(int fd, const std::string& host, std::uint16_t port,
         }
         char tmp[4096];
         for (;;) {
-            ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
-            if (n == 0)
-                break;
-            if (n < 0) {
-                if (errno == EINTR)
-                    continue;
-                break;
+            std::size_t got     = 0;
+            const ReadOutcome r = conn_read(fd, ssl, tmp, sizeof(tmp), got);
+            if (r != ReadOutcome::kData) {
+                break;  // 对端关了就结束；读错误同样只能到此为止
             }
-            body.append(tmp, static_cast<std::size_t>(n));
+            body.append(tmp, got);
             if (body.size() > kMaxBodyBytes) {
                 return ExchangeResult::kFailed;
             }
@@ -431,31 +548,47 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port, const std::str
         *http_status = 0;  // 默认：连状态行都没读到
     }
 
-    const std::string key  = host + ":" + std::to_string(port);
+    const std::shared_ptr<tls::Context> tls_ctx = TlsContext();
+
+    // 池键必须带协议前缀。理由不是洁癖：一旦运行时切换过 TLS（测试里必然会），
+    // 池里就可能躺着另一种协议的连接；按 host:port 取值会把一条明文连接交给
+    // TLS 请求，症状是「第一个请求正常、之后随机失败」，排查成本极高。
+    const std::string key =
+        std::string(tls_ctx ? "tls://" : "tcp://") + host + ":" + std::to_string(port);
     const bool allow_reuse = g_keep_alive.load(std::memory_order_relaxed);
 
     // 最多两轮：第二轮只会发生在「复用的旧连接已经失效」时。
     for (int attempt = 0; attempt < 2; ++attempt) {
         bool reused = false;
-        int fd      = -1;
+        IdleConn conn;
 
         if (allow_reuse) {
-            fd     = ConnectionPool::Instance().Take(key);
-            reused = fd >= 0;
+            conn   = ConnectionPool::Instance().Take(key);
+            reused = conn.fd >= 0;
         }
-        if (fd < 0) {
-            fd     = connect_timeout(host, port, timeout_ms);
-            reused = false;
-        }
-        if (fd < 0) {
-            return false;
+        if (conn.fd < 0) {
+            conn.fd = connect_timeout(host, port, timeout_ms);
+            reused  = false;
+            if (conn.fd < 0) {
+                return false;
+            }
+            if (tls_ctx) {
+                conn.ssl = tls::Session::Connect(*tls_ctx, conn.fd, host);
+                if (!conn.ssl || !do_handshake(conn.fd, *conn.ssl, timeout_ms)) {
+                    // 握手失败不重试：几乎总是「对端没开 TLS」或「证书/CA 不对」，
+                    // 重试只会把一次 2 秒的超时变成两次，故障时反而更慢。
+                    conn.ssl.reset();
+                    ::close(conn.fd);
+                    return false;
+                }
+            }
         }
 
         int status = 0;
         std::string body;
-        bool keep_alive = false;
-        const ExchangeResult r =
-            do_exchange(fd, host, port, path, timeout_ms, extra_headers, &status, body, keep_alive);
+        bool keep_alive        = false;
+        const ExchangeResult r = do_exchange(conn.fd, conn.ssl.get(), host, port, path, timeout_ms,
+                                             extra_headers, &status, body, keep_alive);
 
         if (http_status != nullptr && status != 0) {
             *http_status = status;
@@ -463,15 +596,17 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port, const std::str
 
         if (r == ExchangeResult::kOk) {
             if (keep_alive && allow_reuse) {
-                ConnectionPool::Instance().Put(key, fd);
+                ConnectionPool::Instance().Put(key, std::move(conn));
             } else {
-                ::close(fd);
+                conn.ssl.reset();
+                ::close(conn.fd);
             }
             out = std::move(body);
             return true;
         }
 
-        ::close(fd);
+        conn.ssl.reset();
+        ::close(conn.fd);
 
         // 只在「复用连接上一个字节都没收到」时重试：这说明这条连接在池子里放久了、
         // 已被对端回收，换条新连接重发即可（GET 幂等）。
@@ -482,6 +617,24 @@ bool HttpClient::Get(const std::string& host, std::uint16_t port, const std::str
         return false;
     }
     return false;
+}
+
+bool HttpClient::EnableTls(const tls::ClientConfig& cfg, std::string& err) {
+    std::shared_ptr<tls::Context> ctx = tls::Context::CreateClient(cfg, err);
+    if (!ctx) {
+        return false;
+    }
+
+    // 先清池、再换指针。反过来的话，新请求会拿着 TLS 的池键去取旧连接——
+    // 虽然池键带了协议前缀、取不到，但那些明文连接会一直躺到 TTL 才释放，
+    // 白白占着 fd 和对端资源。
+    ConnectionPool::Instance().Clear();
+    std::atomic_store(&g_tls_ctx, std::move(ctx));
+    return true;
+}
+
+bool HttpClient::TlsEnabled() {
+    return static_cast<bool>(TlsContext());
 }
 
 void HttpClient::SetKeepAlive(bool on) {

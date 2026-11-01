@@ -128,9 +128,9 @@ GetResult HttpPeerPool::GetFromPeer(const std::string& peer, const std::string& 
     // 内部共享 token。即使 hops==0 也一并发送：接收方判定「可信」的依据就是这个头，
     // 与是否需要跳数无关；如果只在 hops>0 时发送，接收方就无法区分「内部请求」与「外部请求」。
     //
-    // ⚠ 局限：节点间是明文 HTTP，token 在网络上是可见的。这里解决的是「外部客户端
-    // 无法伪造内部语义」的应用层信任问题，不能替代传输层加密。跨不可信网络部署时，
-    // 应在节点间加 TLS 或走内网隔离。
+    // 传输层：这条请求走不走 TLS 由 HttpClient::EnableTls 决定，是全局开关而不是逐请求判断
+    // ——「一个请求走 TLS、下一个走明文」等于没加密。开了 TLS 之后 token 不再是网络上的
+    // 明文；没开则仍可被同网段嗅探，启动日志会把这个事实打出来，不让它停留在口头约定上。
     const std::string token = AuthToken();
     if (!token.empty()) {
         headers["X-DCache-Token"] = token;

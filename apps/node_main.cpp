@@ -14,6 +14,7 @@
 #include "http_client.hpp"
 #include "http_server.hpp"
 #include "node.hpp"
+#include "tls.hpp"
 
 using namespace dcache;
 
@@ -63,6 +64,9 @@ struct Options {
     std::string peers = "127.0.0.1:8001";
     std::string group = "scores";
     std::string token;  // 内部共享 token；为空则退回 IP 判定
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_ca;
     int capacity        = 100;
     int ttl_ms          = 0;
     int virtual_nodes   = 150;
@@ -81,7 +85,12 @@ void usage(const char* argv0) {
                  "  --virtual-nodes <n>     每物理节点虚拟节点数 (默认 150)\n"
                  "  --workers <n>            HTTP 工作线程数 (默认 4)\n"
                  "  --report-interval <s>   统计打印间隔秒 (默认 5)\n"
-                 "  --token <s>             内部共享 token（也可用环境变量 DCACHE_TOKEN）\n";
+                 "  --token <s>             内部共享 token（也可用环境变量 DCACHE_TOKEN）\n"
+                 "  --tls-cert <file>       服务端证书 PEM（开启后本节点监听走 TLS）\n"
+                 "  --tls-key <file>        服务端私钥 PEM\n"
+                 "  --tls-ca <file>         校验对端证书用的 CA PEM（出站转发用）\n"
+                 "                          TLS 三个参数必须同时给：只配一半会得到一个\n"
+                 "                          「能收不能发」的节点，现象是请求随机 503。\n";
 }
 
 bool parse_args(int argc, char** argv, Options& o) {
@@ -139,6 +148,21 @@ bool parse_args(int argc, char** argv, Options& o) {
             if (!v)
                 return false;
             o.token = v;
+        } else if (a == "--tls-cert") {
+            const char* v = need("--tls-cert");
+            if (!v)
+                return false;
+            o.tls_cert = v;
+        } else if (a == "--tls-key") {
+            const char* v = need("--tls-key");
+            if (!v)
+                return false;
+            o.tls_key = v;
+        } else if (a == "--tls-ca") {
+            const char* v = need("--tls-ca");
+            if (!v)
+                return false;
+            o.tls_ca = v;
         } else if (a == "--help" || a == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -175,6 +199,30 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 节点间 TLS。三个参数必须同时给：
+    // 本项目的监听口同时服务外部客户端和集群节点，开了 TLS 就是整口 TLS，
+    // 于是「入站加密」必然要求「出站也加密」。只配一半的节点能正常启动、
+    // 但对方一连上来就握手失败，现象是随机 503 —— 与其让运维去猜，
+    // 不如在启动阶段直接拒绝。
+    const bool tls_in  = !o.tls_cert.empty() || !o.tls_key.empty();
+    const bool tls_out = !o.tls_ca.empty();
+    if (tls_in != tls_out || (tls_in && (o.tls_cert.empty() || o.tls_key.empty()))) {
+        std::cerr << "[node] --tls-cert / --tls-key / --tls-ca 必须同时提供\n";
+        return 1;
+    }
+
+    tls::ServerConfig tls_server;
+    if (tls_in) {
+        tls_server.cert_file = o.tls_cert;
+        tls_server.key_file  = o.tls_key;
+
+        std::string tls_err;
+        if (!HttpClient::EnableTls(tls::ClientConfig{o.tls_ca}, tls_err)) {
+            std::cerr << "[node] 客户端 TLS 初始化失败: " << tls_err << "\n";
+            return 1;
+        }
+    }
+
     std::vector<std::string> peers = split(o.peers, ',');
     bool has_self                  = false;
     for (const auto& p : peers) {
@@ -194,6 +242,11 @@ int main(int argc, char** argv) {
     if (o.token.empty()) {
         std::cerr << "[node] 警告：未配置内部 token（--token 或 DCACHE_TOKEN），"
                      "X-DCache-Hops 只能按来源 IP 判定——同机或同网段的任何进程都能伪造该头。\n";
+    } else if (!tls_in) {
+        // token 解决了「伪造」，没解决「窃听」。这句话必须打出来：
+        // 让它停留在文档里的话，运维会以为配了 token 就等于内部通道安全了。
+        std::cerr << "[node] 提示：已配置 token 但未启用 TLS，token 在节点间是明文传输的，"
+                     "同网段可被嗅探（加 --tls-cert/--tls-key/--tls-ca 可关闭这个缺口）。\n";
     }
 
     HttpServer server;
@@ -233,12 +286,22 @@ int main(int argc, char** argv) {
         out += "# TYPE dcache_client_idle_connections gauge\n";
         out += "dcache_client_idle_connections " + std::to_string(HttpClient::IdleConnections()) +
                "\n";
+
+        // TLS 握手失败。它不是「攻击计数器」，而是**配置错误探测器**：
+        // 对端没开 TLS、证书过期、CA 没同步，都会先在这里涨起来。
+        out += "# HELP dcache_tls_handshake_failures_total TLS 握手失败数（多为配置不一致）\n";
+        out += "# TYPE dcache_tls_handshake_failures_total counter\n";
+        out += "dcache_tls_handshake_failures_total " + std::to_string(m.handshake_failures) + "\n";
+
+        out += "# HELP dcache_tls_enabled 入站是否启用 TLS（1/0）\n";
+        out += "# TYPE dcache_tls_enabled gauge\n";
+        out += std::string("dcache_tls_enabled ") + (m.tls_enabled ? "1\n" : "0\n");
     });
 
     if (!server.Start(
             host, port,
             [&node](const HttpRequest& req, HttpResponse& resp) { node.ServeHTTP(req, resp); },
-            o.workers)) {
+            o.workers, tls_server)) {
         std::cerr << "启动失败: " << o.self << "\n";
         return 1;
     }
@@ -247,7 +310,8 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
 
     std::cout << "[node] listening on " << o.self << " group=" << o.group << " peers=" << o.peers
-              << " auth=" << (o.token.empty() ? "off" : "token") << "\n";
+              << " auth=" << (o.token.empty() ? "off" : "token")
+              << " tls=" << (tls_in ? tls::Backend() : std::string("off")) << "\n";
 
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(o.report_interval));

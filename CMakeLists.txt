@@ -64,6 +64,12 @@ if(DCACHE_FUZZ)
     add_link_options(-fsanitize=address)
 endif()
 
+# 节点间 TLS：-DDCACHE_TLS=OFF 时编出桩实现（include/tls.hpp 接口不变，
+# 运行时明确报「不可用」）。刻意选择「找不到 OpenSSL 就 configure 失败」而不是
+# 静默降级成明文：静默降级会让「本节点已启用 TLS」这个结论在别人的机器上不成立，
+# 而这种事只有在出事之后才会被发现。
+option(DCACHE_TLS "节点间 TLS（需要 OpenSSL）" ON)
+
 # 统一告警开关。必须在 target 定义前声明，才能作用于 dcache_core 本身。
 function(dcache_add_warnings target)
     if(MSVC)
@@ -87,6 +93,19 @@ add_library(dcache_core
 target_include_directories(dcache_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(dcache_core PUBLIC cxx_std_17)
 target_link_libraries(dcache_core PUBLIC Threads::Threads)
+
+# TLS 实现二选一。用 target_sources 而不是把两个文件都写进 add_library：
+# 同时编进来会得到重复定义的 TLS 符号，而链接期的报错信息通常指着不相干的地方。
+if(DCACHE_TLS)
+    find_package(OpenSSL REQUIRED)
+    target_sources(dcache_core PRIVATE src/tls_openssl.cpp)
+    target_compile_definitions(dcache_core PUBLIC DCACHE_TLS=1)
+    target_link_libraries(dcache_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+else()
+    target_sources(dcache_core PRIVATE src/tls_stub.cpp)
+    message(STATUS "DCACHE_TLS=OFF：节点间 TLS 不可用（桩实现）")
+endif()
+
 # 库本体占全项目约 90% 的代码量，此前漏加了告警开关（只对 app/test 生效）。
 dcache_add_warnings(dcache_core)
 
@@ -108,6 +127,13 @@ set(DCACHE_TESTS
     test_url
     test_http_parser
     test_node)
+
+# TLS 测试要自己签发证书（用 OpenSSL API，不依赖 openssl 命令行），
+# 因此只在 DCACHE_TLS=ON 时存在。
+if(DCACHE_TLS)
+    list(APPEND DCACHE_TESTS test_tls)
+endif()
+
 foreach(t IN LISTS DCACHE_TESTS)
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE dcache_core)

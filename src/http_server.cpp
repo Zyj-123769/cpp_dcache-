@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -123,9 +124,24 @@ HttpServer::~HttpServer() {
 }
 
 bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler handler,
-                       int worker_count) {
+                       int worker_count, const tls::ServerConfig& tls_cfg) {
     if (listen_fd_ >= 0) {
         return false;  // 已启动
+    }
+
+    // TLS 上下文必须在监听之前建好：证书/私钥有问题时应该在启动阶段失败，
+    // 而不是让服务跑起来、每个握手都失败、运维从 handshake_failures 里猜原因。
+    if (!tls_cfg.cert_file.empty() || !tls_cfg.key_file.empty()) {
+        std::string err;
+        tls_ctx_ = tls::Context::CreateServer(tls_cfg, err);
+        if (!tls_ctx_) {
+            std::fprintf(stderr, "[http] TLS 初始化失败: %s\n", err.c_str());
+            return false;
+        }
+        tls_enabled_ = true;
+    } else {
+        tls_ctx_.reset();
+        tls_enabled_ = false;
     }
 
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -218,6 +234,7 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
     responses_4xx_.store(0, std::memory_order_relaxed);
     responses_5xx_.store(0, std::memory_order_relaxed);
     active_conns_.store(0, std::memory_order_relaxed);
+    handshake_failures_.store(0, std::memory_order_relaxed);
 
     // 预留一个 fd，供 EMFILE 时自救（见 run()）。取不到不影响启动，只是少一层保护。
     reserve_fd_ = ::open("/dev/null", O_RDONLY);
@@ -244,12 +261,14 @@ bool HttpServer::Start(const std::string& addr, std::uint16_t port, Handler hand
 
 HttpServer::Metrics HttpServer::GetMetrics() const {
     Metrics m;
-    m.requests_total   = requests_total_.load(std::memory_order_relaxed);
-    m.requests_dropped = requests_dropped_.load(std::memory_order_relaxed);
-    m.responses_2xx    = responses_2xx_.load(std::memory_order_relaxed);
-    m.responses_4xx    = responses_4xx_.load(std::memory_order_relaxed);
-    m.responses_5xx    = responses_5xx_.load(std::memory_order_relaxed);
-    m.active_conns     = active_conns_.load(std::memory_order_relaxed);
+    m.requests_total     = requests_total_.load(std::memory_order_relaxed);
+    m.requests_dropped   = requests_dropped_.load(std::memory_order_relaxed);
+    m.responses_2xx      = responses_2xx_.load(std::memory_order_relaxed);
+    m.responses_4xx      = responses_4xx_.load(std::memory_order_relaxed);
+    m.responses_5xx      = responses_5xx_.load(std::memory_order_relaxed);
+    m.active_conns       = active_conns_.load(std::memory_order_relaxed);
+    m.handshake_failures = handshake_failures_.load(std::memory_order_relaxed);
+    m.tls_enabled        = tls_enabled_;
     return m;
 }
 
@@ -287,9 +306,11 @@ void HttpServer::Stop() {
         leftover_conns.swap(recycled_);
     }
     for (auto& t : leftover) {
+        t.ssl.reset();  // 先释放会话再关 fd（SSL_free 不做 I/O，顺序只是防日后改动踩坑）
         ::close(t.fd);
     }
     for (auto& r : leftover_conns) {
+        r.ssl.reset();
         ::close(r.fd);
     }
 
@@ -382,15 +403,44 @@ void HttpServer::run() {
                             conn.remote_ip = ip;
                         }
                         conn.last_active = std::chrono::steady_clock::now();
-                        conns_[cfd]      = std::move(conn);
+
+                        if (tls_enabled_) {
+                            conn.ssl = tls::Session::Accept(*tls_ctx_, cfd);
+                            if (!conn.ssl) {
+                                // SSL_new 失败基本只有「内存耗尽」一种可能，
+                                // 但无论如何都不能把一条没有会话的连接留在表里。
+                                handshake_failures_.fetch_add(1, std::memory_order_relaxed);
+                                ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, cfd, nullptr);
+                                ::close(cfd);
+                                continue;
+                            }
+                            conn.handshaking = true;
+                        }
+
+                        conns_[cfd] = std::move(conn);
+
+                        if (tls_enabled_) {
+                            // 立刻推一次握手，并在握手完成后顺手读一次。
+                            // 为什么不能只推握手就走：客户端常把 Finished 和第一个请求
+                            // 放在同一个 TCP 段里，握手结束时那些字节已经进了 SSL 的
+                            // 内部缓冲、socket 早就被读空 —— epoll 不会再为它触发
+                            // EPOLLIN，请求会一直躺到 10 秒空闲回收。
+                            // handle_read 内部会先判握手状态，所以这一步可以合并。
+                            handle_read(cfd);
+                        }
                     } else {
                         ::close(cfd);
                     }
                 }
-            } else if (ev & EPOLLIN) {
+            } else if (ev & (EPOLLIN | EPOLLOUT)) {
                 // 必须先处理 EPOLLIN 再处理 HUP/ERR：
                 // 「发完请求立刻 close」的客户端会同时带回 EPOLLIN|EPOLLHUP，
                 // 若先走 HUP 分支直接关连接，缓冲区里那条完整请求就被丢掉了。
+                //
+                // EPOLLOUT 只在 TLS 握手期间被关注（handshake 需要回写时）。
+                // 它是水平触发的：一旦注册且 socket 可写，每次 epoll_wait 都会立刻返回，
+                // 所以 drive_handshake 必须在每次推进后重新收敛关注事件，
+                // 否则这里会变成 100% CPU 空转——和 EMFILE 那个自旋是同一类 bug。
                 handle_read(fd);
             } else if (ev & (EPOLLHUP | EPOLLERR)) {
                 close_conn(fd);
@@ -421,11 +471,50 @@ void HttpServer::handle_read(int fd) {
         return;  // 已移交给工作线程，忽略同批残留事件
     }
     it->second.last_active = std::chrono::steady_clock::now();
-    std::string& buf       = it->second.read_buf;
+
+    // TLS 握手期间没有应用层字节可读，先把握手推完。
+    if (it->second.handshaking && !drive_handshake(fd, it->second)) {
+        return;  // 握手失败，drive_handshake 内部已经关闭连接
+    }
+
+    // drive_handshake 可能关过连接、也可能刚完成握手，迭代器要重新取。
+    it = conns_.find(fd);
+    if (it == conns_.end()) {
+        return;
+    }
+    if (it->second.handshaking) {
+        return;  // 还差一轮，等下一次事件
+    }
+
+    Conn& c          = it->second;
+    std::string& buf = c.read_buf;
 
     char tmp[8192];
     bool eof = false;
     for (;;) {
+        if (c.ssl) {
+            tls::Io io   = tls::Io::kOk;
+            const long n = c.ssl->Read(tmp, sizeof(tmp), io);
+            if (n > 0) {
+                buf.append(tmp, static_cast<std::size_t>(n));
+                if (buf.size() > kMaxRequestSize) {
+                    close_conn(fd);  // 报文超限，无需再读
+                    return;
+                }
+                // 继续读：SSL 内部可能还缓存着字节，而 epoll 看不到它们
+                // （socket 已经被读空就不会再触发 EPOLLIN）——这是 TLS 下最典型的丢事件。
+                continue;
+            }
+            if (io == tls::Io::kWantRead || io == tls::Io::kWantWrite) {
+                // kWantWrite 在这里意味着对端在要求我们回写（TLS 1.3 不做重协商，
+                // 我们又没请求客户端证书，所以基本不会发生）。不额外注册 EPOLLOUT：
+                // 已经读到的字节足够继续处理，剩下的输出会在工作线程写响应时被一并冲刷。
+                break;
+            }
+            eof = true;  // kClosed / kFailed：都不能再有数据了
+            break;
+        }
+
         ssize_t n = ::recv(fd, tmp, sizeof(tmp), 0);
         if (n > 0) {
             buf.append(tmp, static_cast<std::size_t>(n));
@@ -456,7 +545,9 @@ void HttpServer::handle_read(int fd) {
         Task t;
         t.fd            = fd;
         t.req           = std::move(req);
-        t.req.remote_ip = it->second.remote_ip;  // 必须在 conns_.erase 之前取
+        t.req.remote_ip = c.remote_ip;  // 必须在 conns_.erase 之前取
+        // TLS 会话跟着 fd 一起走：工作线程写响应时要用它，而 SSL 对象只能有一个所有者。
+        t.ssl = std::move(c.ssl);
 
         // 缓冲区里若还有一条完整请求（HTTP pipelining），本次交接后这些字节就丢了。
         // 本项目的客户端都是「一问一答」，不会走这条路径；但不能假装它不存在——
@@ -484,7 +575,8 @@ void HttpServer::handle_read(int fd) {
     close_conn(fd);
 }
 
-void HttpServer::handle_request(int fd, HttpRequest req, bool pipelined) {
+void HttpServer::handle_request(int fd, HttpRequest req, std::unique_ptr<tls::Session> ssl,
+                                bool pipelined) {
     HttpResponse resp;
     resp.status = 200;
 
@@ -512,27 +604,36 @@ void HttpServer::handle_request(int fd, HttpRequest req, bool pipelined) {
     const std::string data = build_response(resp, keep_alive);
 
     // 阻塞写 + 发送超时：慢客户端最多占用 worker kSendTimeoutMs，之后放弃。
+    // TLS 的记录层同样受这个超时约束（SSL_write 底下就是 send）。
     set_nonblocking(fd, false);
     set_send_timeout(fd, kSendTimeoutMs);
-    const bool wrote = write_all(fd, data);
+    const bool wrote = ssl ? ssl->WriteAll(data.data(), data.size()) : write_all(fd, data);
 
     // 只有「客户端明确要求复用」且「响应完整写出」才把连接交还事件循环。
     // 写失败说明对端已关闭或写超时，复用毫无意义；关停过程中也不再挂回 epoll。
+    //
+    // 注意 TLS 的特殊性：WriteAll 失败时可能只写出半个记录，会话已经不可恢复，
+    // 绝不能把这条连接塞回池子——那会让下一个请求读到错位的字节流。
     if (keep_alive && wrote && !stop_) {
-        recycle_conn(fd, req.remote_ip);
+        recycle_conn(fd, std::move(ssl), req.remote_ip);
         return;
     }
+
+    // 先释放会话再关 fd。SSL_free 本身不做 I/O（socket BIO 是 BIO_NOCLOSE 的），
+    // 但顺序写死在这里，免得以后有人往析构里加 SSL_shutdown 时踩到已关闭的 fd。
+    ssl.reset();
     ::close(fd);
 }
 
-void HttpServer::recycle_conn(int fd, const std::string& remote_ip) {
+void HttpServer::recycle_conn(int fd, std::unique_ptr<tls::Session> ssl,
+                              const std::string& remote_ip) {
     // 工作线程为了阻塞写把 fd 设成了阻塞模式，交还前必须还原：
     // 事件循环里的 recv 是非阻塞假设的，一个阻塞 fd 会把整个事件循环卡死。
     set_nonblocking(fd, true);
 
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
-        recycled_.push_back(Recycled{fd, remote_ip});
+        recycled_.push_back(Recycled{fd, std::move(ssl), remote_ip});
     }
 
     // 立刻唤醒 epoll。不唤醒的话，这根连接要等 epoll_wait 的 100ms 超时才被重新注册，
@@ -574,6 +675,8 @@ void HttpServer::drain_recycled() {
 
         Conn conn;
         conn.remote_ip   = std::move(r.remote_ip);
+        conn.ssl         = std::move(r.ssl);  // 会话跟着 fd 回到事件循环
+        conn.handshaking = false;             // 能走到这里说明握手早就完成了
         conn.last_active = now;
         conns_[r.fd]     = std::move(conn);
     }
@@ -594,7 +697,7 @@ void HttpServer::worker_loop() {
         }
         // 先取值再 move：避免依赖实参求值顺序（move 之后 t 处于未指定状态）。
         const bool pipelined = t.pipelined;
-        handle_request(t.fd, std::move(t.req), pipelined);
+        handle_request(t.fd, std::move(t.req), std::move(t.ssl), pipelined);
     }
 }
 
@@ -606,6 +709,50 @@ void HttpServer::close_conn(int fd) {
     }
     ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
     ::close(fd);
+}
+
+bool HttpServer::set_interest(int fd, std::uint32_t events) {
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    ev.events  = events;
+    ev.data.fd = fd;
+    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == 0;
+}
+
+bool HttpServer::drive_handshake(int fd, Conn& c) {
+    if (!c.ssl) {
+        c.handshaking = false;
+        return true;
+    }
+
+    // 每次推进都刷新活跃时间：握手也要受 slowloris 那套空闲回收约束，
+    // 否则「连上不发 ClientHello」的连接会一直占着 fd。
+    c.last_active = std::chrono::steady_clock::now();
+
+    const tls::Step st = c.ssl->Handshake();
+
+    if (st == tls::Step::kOk) {
+        c.handshaking = false;
+        // 握手期间可能为了回写注册过 EPOLLOUT，这里必须收回来。
+        // 水平触发的 EPOLLOUT 一旦留着，事件循环会每轮都被唤醒并空转 100% CPU。
+        set_interest(fd, EPOLLIN);
+        return true;
+    }
+
+    if (st == tls::Step::kFailed) {
+        // 不计入 requests_dropped：那不是「报文非法」，而是「压根没谈到 HTTP 这一层」。
+        // 单独计数才有诊断价值——它涨起来基本等于「对端没开 TLS」或「证书/CA 配错了」。
+        handshake_failures_.fetch_add(1, std::memory_order_relaxed);
+        close_conn(fd);
+        return false;
+    }
+
+    // 只关注真正需要的那一侧，避免把不需要的事件也打开造成空转。
+    const std::uint32_t want = (st == tls::Step::kWantWrite)
+                                   ? static_cast<std::uint32_t>(EPOLLIN | EPOLLOUT)
+                                   : static_cast<std::uint32_t>(EPOLLIN);
+    set_interest(fd, want);
+    return true;
 }
 
 void HttpServer::sweep_idle() {
@@ -627,10 +774,17 @@ void HttpServer::sweep_idle() {
 }
 
 void HttpServer::cleanup() {
+    // 先把 fd 号收集起来，再清表：清表会析构每个 Conn 里的 Session（SSL_free）。
+    // 顺序上「先释放会话、再关 fd」，与 handle_request 保持一致。
+    std::vector<int> fds;
+    fds.reserve(conns_.size());
     for (auto& kv : conns_) {
-        ::close(kv.first);
+        fds.push_back(kv.first);
     }
     conns_.clear();
+    for (int fd : fds) {
+        ::close(fd);
+    }
     active_conns_.store(0, std::memory_order_relaxed);
 
     // 事件循环退出后，仍可能有工作线程交还但未被 drain 的连接。

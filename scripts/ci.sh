@@ -61,16 +61,37 @@ configure_build_test() {
     local name="$1" dir="$2"
     shift 2
 
+    # 目录必须先建出来。`> log` 的重定向在命令运行**之前**执行，目录不存在时
+    # bash 连日志都打不开；那一次 fuzz 的 job 就是这么「0 秒红、零信息」的。
+    mkdir -p "$dir"
+
     log "[$name] 配置"
-    cmake -S . -B "$dir" "$@"
+    if ! cmake -S . -B "$dir" "$@" 2>&1 | tee "$dir/configure.log"; then
+        report error "[$name] 配置失败" "$(tail -n 8 "$dir/configure.log" | tr '\n' ' ')"
+        return 1
+    fi
 
     log "[$name] 构建（-j $JOBS）"
-    cmake --build "$dir" -j "$JOBS"
+    if ! cmake --build "$dir" -j "$JOBS" 2>&1 | tee "$dir/build.log"; then
+        # 编译错误只在日志里，而日志要仓库 admin 权限才读得到。
+        # 把最后几行打成注解，失败原因就变成了匿名可读的——否则我只能看到
+        # 一个红叉，然后靠猜着改。这条通道不是给「好看的报告」用的，
+        # 是为了让诊断不必依赖权限。
+        local why
+        why="$(grep -E 'error:|Error' "$dir/build.log" | head -5 | tr '\n' ' ' || true)"
+        report error "[$name] 构建失败" "$why"
+        return 1
+    fi
 
     log "[$name] 测试"
     # --output-on-failure 是必须的：CI 里失败用例的输出默认被吞掉，
     # 只留一行 "1 test failed"，排查时等于没有信息。
-    ctest --test-dir "$dir" --output-on-failure
+    if ! ctest --test-dir "$dir" --output-on-failure 2>&1 | tee "$dir/ctest.log"; then
+        local why
+        why="$(grep -E 'FAILED|Failed|\*\*\*' "$dir/ctest.log" | head -5 | tr '\n' ' ' || true)"
+        report error "[$name] 测试失败" "$why"
+        return 1
+    fi
 }
 
 do_build() {
@@ -230,6 +251,15 @@ do_fuzz() {
     done
     return "$rc"
 }
+
+# 依赖探针：把 TLS 后端版本打成注解。
+# 和 fuzz 那次同一个理由——「TLS 已启用」如果只写在文档里，就没有任何人能核实。
+# 本地跑时 report 直接返回，不会污染终端。
+if command -v openssl >/dev/null 2>&1; then
+    report notice "openssl" "$(openssl version 2>&1)"
+else
+    report warning "openssl" "未找到 openssl：DCACHE_TLS=ON（默认）需要 libssl-dev"
+fi
 
 case "${1:-}" in
     build) do_build ;;

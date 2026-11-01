@@ -1,5 +1,7 @@
 #pragma once
 
+#include "tls.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -28,6 +30,17 @@ public:
 
     // 开关连接复用。关闭后退回「每请求一次 TCP」，行为与旧实现一致（排查问题时用）。
     static void SetKeepAlive(bool on);
+
+    // 打开节点间的 TLS（给定 CA 文件，用于校验对端证书）。
+    //
+    // 只在**出站**方向生效；入站由 HttpServer::Start 的 tls 参数控制。两侧都开才算
+    // 真的加密——只开一侧连不上，这正是刻意的：一个「自动降级成明文」的开关
+    // 会让「已启用 TLS」这个结论永远不成立。
+    //
+    // 必须在并发调用 Get 之前完成（和 SetKeepAlive 同一条约束）。
+    // 切换时会清空空闲连接池：池里的连接属于另一种协议，留着就是对不上话的僵尸。
+    static bool EnableTls(const tls::ClientConfig& cfg, std::string& err);
+    static bool TlsEnabled();
 
     // 当前空闲连接数（用于 /metrics 观察池子是否漏连接）。
     static std::size_t IdleConnections();
