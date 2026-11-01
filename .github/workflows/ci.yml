@@ -98,7 +98,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build & run fuzzers
+      # runner 镜像里并不保证有 clang++（默认工具链是 gcc），显式装一次。
+      # 第一版忘了装，步骤在 `clang++ --version` 那一行就退了 —— 而且因为在脚本之前，
+      # 连注解都来不及打，只留下一个 6 秒的红叉。
+      - name: Install clang
         run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
           clang++ --version
-          bash scripts/ci.sh fuzz
+      - name: Build & run fuzzers
+        run: bash scripts/ci.sh fuzz
