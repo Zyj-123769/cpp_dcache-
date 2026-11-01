@@ -56,6 +56,7 @@ include/              头文件（模板实现见 src/*.tpp）
   singleflight.hpp     并发回源去重
   json.hpp             JSON 编解码（节点间报文）
   auth.hpp             常量时间的 token 比较（内部接口信任边界）
+  tls.hpp              节点间 TLS 的最小封装（pimpl，不暴露 OpenSSL 类型）
   http.hpp             HttpRequest / HttpResponse
   http_client.hpp      同步 HTTP GET 客户端
   http_server.hpp      epoll HTTP 服务器（事件循环 + 工作线程池）
@@ -108,11 +109,12 @@ CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本�
 >
 > CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
-> **行覆盖率 79%**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
+> **行覆盖率 78%**（2136 行中 1674 行，地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
 > **三个 libFuzzer 目标**（json / url / HTTP 请求行）按不变式断言跑，**首轮就撞出并修掉了
 > 一个 P0 级缺陷**：JSON 字段扫描不认字符串边界，值里出现 `"found"` 片段时会把「命中」读成「未命中」。
 > 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读；
-> fuzz 那一轮见第十三节。
+> fuzz 那一轮见第十三节，**节点间 TLS** 见第十四节。
+> 8 个测试二进制（含 6 组 TLS 用例，其中 3 组断言的是「必须失败」）。
 
 
 ### 单机演示
@@ -143,8 +145,34 @@ export DCACHE_TOKEN=$(head -c 24 /dev/urandom | base64)   # 所有节点用同�
 
 `--token` 参数也支持，但命令行参数在 `ps aux` 里对同机所有用户可见，**优先用环境变量**。
 
-> 局限：节点间仍是明文 HTTP，token 在网络上是可见的。它解决的是「外部客户端伪造内部语义」，
-> 不能替代传输层加密；跨不可信网络部署需在节点之间加 TLS 或做内网隔离。
+> token 解决「你是谁」，不解决「谁在听」。要关掉窃听这个缺口，见下一节。
+
+### 节点间 TLS
+
+```bash
+# 自签一张带 IP SAN 的证书（生产请用真 CA 签发）
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout node.key -out node.crt \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+export DCACHE_TOKEN=$(head -c 24 /dev/urandom | base64)
+./node --self 127.0.0.1:8001 --peers 127.0.0.1:8001,127.0.0.1:8002 \
+       --tls-cert node.crt --tls-key node.key --tls-ca node.crt
+
+# 客户端也要用 TLS（同一张证书当 CA）
+curl --cacert node.crt https://127.0.0.1:8001/api/scores/k1
+```
+
+三个参数必须同时给：本项目的监听口同时服务外部客户端和集群节点，开了 TLS 就是整口 TLS，
+所以「入站加密」必然要求「出站也加密」。只配一半的节点能起来、但对方一连就握手失败，
+现象是随机 503，所以启动阶段直接拒绝。
+
+证书校验是**强制**的（`SSL_VERIFY_PEER` + CA），没有「先不校验、跑通再说」的开关——
+那种开关会让后面所有「已启用 TLS」的结论失去意义。按 IP 连接时走 iPAddress SAN 校验，
+按域名连接时走 SNI + DNS SAN，两条分支都覆盖了（`tests/test_tls.cpp` 里有对应反向用例）。
+
+`-DDCACHE_TLS=OFF` 可以编出不带 OpenSSL 的版本；此时配了 TLS 参数会启动失败并说明原因，
+**不会静默退回明文**。
 
 ### 监控指标
 
@@ -162,9 +190,12 @@ export DCACHE_TOKEN=$(head -c 24 /dev/urandom | base64)   # 所有节点用同�
 | `dcache_http_active_connections` | gauge | 当前挂起连接数（含 keep-alive 空闲） |
 | `dcache_client_idle_connections` | gauge | 节点间转发的空闲连接数（复用是否生效） |
 | `dcache_hops_rejected_total` | counter | 带 `X-DCache-Hops` 但过不了校验的次数 —— **有人在伪造内部头** |
+| `dcache_tls_enabled` | gauge | 入站是否启用 TLS（1/0），一眼看出配置有没有生效 |
+| `dcache_tls_handshake_failures_total` | counter | TLS 握手失败数 —— 多半是**配置错误探测器**（对端没开 TLS / 证书过期 / CA 没同步） |
 
-后三项是这次新加的观测点：`requests_dropped_total` 和 `hops_rejected_total` 覆盖的是
-「根本没进业务逻辑」的请求，只看访问日志是发现不了的。
+其中 `requests_dropped_total` / `hops_rejected_total` / `tls_handshake_failures_total` 覆盖的都是
+「根本没进业务逻辑」的请求，只看访问日志是发现不了的。`tls_enabled` 尤其重要：
+它是「你以为配了 TLS」和「实际配了 TLS」之间唯一的机器可读判据。
 
 ### 连接复用
 

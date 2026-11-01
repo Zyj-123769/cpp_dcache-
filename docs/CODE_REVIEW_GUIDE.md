@@ -102,6 +102,8 @@
 - [ ] 慢速攻击：阻塞写是否有超时？单连接能否长期占用 worker？
 - [ ] 信息泄露：`/stats` 等运维接口是否对外开放且无鉴权？
 - [ ] 格式化：是否全部使用 `snprintf` 而非 `sprintf`？
+- [ ] ★ **传输层**：节点间是否加密？token 是否以明文过网？客户端是否**强制**校验证书
+      （包括 IP 字面量走 `set1_ip_asc` 而不是 `set1_host`）？
 
 ### 5.5 性能
 
@@ -140,11 +142,12 @@
 | 编译告警 | `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | 0 warning，加 `-Werror` | 前四个已开，`-Wconversion` 未开 ⚠️ |
 | 格式 | `clang-format`（已提供 `.clang-format`） | 零 diff | 已实跑，全仓零 diff ✅（版本钉死 23.1.3） |
 | 静态分析 | `clang-tidy`（已提供 `.clang-tidy`） | P0 级诊断 0 条 | 已实跑通过 ✅ |
-| 单元测试 | `ctest` | 100% 通过 | 7/7 通过 ✅（含 12 段并发/异常/协议回归 + 10 条解析器边界） |
+| 单元测试 | `ctest` | 100% 通过 | 8/8 通过 ✅（含 12 段并发/异常/协议回归 + 10 条解析器边界 + 6 组 TLS 用例） |
 | 内存/UB | ASan + UBSan | 0 error | 已实跑，零报告 ✅ |
 | 数据竞争 | TSan | 0 warning | 已实跑，零报告 ✅ |
-| 覆盖率 | `gcovr`（`scripts/ci.sh coverage`） | 行覆盖率 ≥ 75% | 已实跑 ✅（**79%**：1805 行中 1439 行被执行） |
+| 覆盖率 | `gcovr`（`scripts/ci.sh coverage`） | 行覆盖率 ≥ 75% | 已实跑 ✅（**78%**：2136 行中 1674 行被执行） |
 | 模糊测试 | libFuzzer（`scripts/ci.sh fuzz`） | 无 crash / 不变式成立 | 已实跑 ✅（json / url / http_request 各 30s，**首轮即撞出 1 个 P0 级缺陷**） |
+| 传输层加密 | OpenSSL（`-DDCACHE_TLS=ON`，默认） | 握手成功且**校验失败必须拒绝** | 已实跑 ✅（6 组用例含 3 组反向；关掉校验会立刻变红，见报告 14.7） |
 
 > 这张表里「配了但没跑」比「缺失」更危险：缺失你知道没有，配了没跑却容易被当成已通过。
 > 本项目的 `.clang-format` 就在仓库里躺了四批才被真正执行，首跑直接报出 32 个文件不合规；
@@ -158,7 +161,7 @@ CI 拆成 6 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` /
 ### 6.1 覆盖率门禁是怎么设计的（以及三个坑）
 
 `-DDCACHE_COVERAGE=ON` 打开 `--coverage -O0 -g`，`gcovr --fail-under-line` 卡 75%。
-首跑实测 **79%**（1805 行可执行代码中 1439 行被执行）。地板值取 75 而不是 79：
+首跑实测 **79%**（后来加入 TLS 后是 2136 行中 1674 行 = 78%）。地板值取 75 而不是 79：
 留 3 个点给工具版本差异（`gcovr`/`gcc` 的计数口径会小幅漂移），
 超过这个余量的下跌只可能是真的少测了。再往上抬按「实测 − 3」逐步收紧。
 
@@ -228,6 +231,31 @@ CI 拆成 6 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` /
 
 ---
 
+### 6.3 TLS 不是「加个开关」，是四处所有权和时序的改动
+
+`-DDCACHE_TLS=ON` 之后节点间走 TLS。这一节记录**重做时不要再踩**的东西：
+
+1. **OpenSSL 类型不许进头文件。** `http_server.hpp` 里出现 `SSL_CTX*`，`DCACHE_TLS=OFF`
+   的构建就得在事件循环、连接结构体、写响应分支里各套一层 `#ifdef`。用一个
+   `include/tls.hpp`（pimpl 句柄 + 两个枚举）+ 两个实现文件（`tls_openssl.cpp` /
+   `tls_stub.cpp`）把条件编译挡在库外面。
+2. **缺 OpenSSL 就 configure 失败，不许静默降级成明文。** 静默降级会让「已启用 TLS」
+   这个结论在别人机器上不成立，而这种事只有出事之后才会被发现。
+3. **握手必须非阻塞，且每次推进都要收敛 epoll 关注事件。** `EPOLLOUT` 是水平触发的：
+   注册了不放，`epoll_wait` 每轮立刻返回，直接 100% CPU 空转。
+4. **`SSL_pending` 会丢事件。** 握手完成时应用数据可能已经在 SSL 内部缓冲里，
+   而 socket 早被读空——epoll 不会再触发 `EPOLLIN`。所以握手推完必须接着读一次。
+5. **`SSL*` 跟着 fd 跨线程。** `Task` / `Recycled` / `Conn` 三处都要带，用 `unique_ptr`
+   表达所有权，`conns_.erase()` 顺带释放。手写 `SSL_free` 迟早漏一次。
+6. **写失败即不可恢复。** 半个 TLS 记录写出去之后这条会话就废了，绝不能因为
+   「客户端要 keep-alive」而把连接塞回池子。
+
+测试侧的规矩同样重要：**反向用例必须存在且能红**。`test_tls` 里 3 组用例断言的是
+「必须失败」（错误的 CA / 明文打 TLS 口 / 证书没有对应 IP SAN），
+并用一次实际提交（把 `VERIFY_PEER` 改成 `VERIFY_NONE`）验证过它们真的会红。
+
+---
+
 ## 7. 评分卡（用于季度健康度评估）
 
 每个维度 0–100 分，按权重加权。评分锚点：
@@ -286,6 +314,6 @@ CI 拆成 6 个 job：`build-and-test` / `sanitizers`（ASan+UBSan） / `tsan` /
 **长期（常态化）**
 8. 每月出一次评分卡 + 度量表
 9. `json`/`url`/`http` 三处解析器加 libFuzzer — ✅ 已完成（第 6 批）
-10. 节点间 TLS（内部 token 目前明文，同网段可嗅探）
+10. 节点间 TLS（内部 token 曾是明文，同网段可嗅探）— ✅ 已完成（第 7 批）
 11. worker 阻塞模型改非阻塞/协程（当前一个慢客户端占一个 worker）
 12. fuzz 语料入库（把 CI 跑出来的高价值样本提交回 `fuzz/corpus/`），并考虑夜间长跑
