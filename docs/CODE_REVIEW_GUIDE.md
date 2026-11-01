@@ -147,6 +147,15 @@
 
 CI 建议拆成 4 个 job：`build-and-test` / `sanitize-asan-ubsan` / `sanitize-tsan` / `lint`。
 
+**构建命令只写一份。** 四个 job 都调用 `scripts/ci.sh <build|asan|tsan|lint>`，CI 配置里只声明「在哪个 runner 上跑哪一项」。这样换平台（GitHub Actions → Gitee Go / Jenkins / 云效）时改的是平台方言，构建逻辑不动，也不会出现「一边加了 Sanitizer、另一边忘了」的漂移。
+
+**平台选择要注意的一点：** 本仓库主仓在 Gitee，但 `.github/workflows/ci.yml` 是 GitHub Actions 的格式，**Gitee 不会执行它**。Gitee Go 挂在企业版下（可免费开通企业试用），且执行自定义脚本的 `shell@agent` 步骤需要自备 Linux 主机接入主机组 —— 个人仓库指望「云端免费跑 ctest」是走不通的。因此 CI 实际生效需要满足其一：
+
+- 推到 GitHub（公开仓库 Actions 免费），或
+- 在 Gitee 侧接一个能拉仓库的外部流水线（云效 / Jenkins，需自备执行节点）。
+
+在 CI 真正跑起来之前，**不要把「CI 全绿」当作已达成**，本地 `bash scripts/ci.sh all` 是同一份逻辑，可以先跑。
+
 ---
 
 ## 7. 评分卡（用于季度健康度评估）
@@ -192,10 +201,11 @@ CI 建议拆成 4 个 job：`build-and-test` / `sanitize-asan-ubsan` / `sanitize
 
 ## 9. 落地路线
 
-**第 1 周（止血）**
-1. `git init` 并把仓库纳入版本控制（当前无 `.git`，CI 永远不会触发）
-2. 合入 `.clang-format`、`.clang-tidy`、PR 模板，CI 增加 lint job
-3. 修复报告中的 6 个 P0
+**第 1 周（止血）— ✅ 已完成**
+
+1. ✅ `git init` 并纳入版本控制，已推送 Gitee `happy-everyday-optimistic/c--distributed-caching`
+2. ✅ 合入 `.clang-format`、`.clang-tidy`、PR 模板，CI 增加 lint job
+3. ✅ 修复报告中的 6 个 P0（另修 6 个连接层缺陷）
 
 **第 2–4 周（固化）**
 4. CI 增加 TSan job；Sanitizer 改为全局插桩

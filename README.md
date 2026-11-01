@@ -86,6 +86,19 @@ ctest --test-dir build --output-on-failure
 
 可选 Sanitizer：`cmake -S . -B build -DDCACHE_SANITIZE=address,undefined`。
 
+### 方式三：一键跑全部门禁
+
+```bash
+bash scripts/ci.sh all     # build -> asan -> tsan -> lint
+```
+
+CI（`.github/workflows/ci.yml`）的四个 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
+除了平台差异（Linux vs Windows）之外，两边不会有第二套命令。
+
+> 注：本仓库主仓在 Gitee，但 Gitee 不执行 `.github/workflows/`，CI 实际生效需要推到 GitHub
+> 或接入外部流水线，详见 `docs/CODE_REVIEW_GUIDE.md` 第 6 节。
+
+
 ### 单机演示
 
 ```bash
