@@ -137,5 +137,15 @@ int main() {
     }
     CHECK_EQ(invalid, 0U);
 
+    // 反向契约：非转义字节必须**逐字节透传**，不能因为「不像合法文本」就改写。
+    // 缓存值可以是任意字节串，把这一层做成「顺手做 UTF-8 校验并修复」会悄悄
+    // 改掉用户数据——那比留一个乱码更糟，因为它是静默的。
+    //
+    // 这条也是上面那条 fuzz 不变式必须带「输入合法」前提的原因：透传是设计，
+    // 所以「畸形输入 → 畸形输出」是调用方违反前提，不是 decoder 的缺陷。
+    const std::string raw_bytes("\xFF\x01\x80", 3);
+    CHECK(JsonUnescape(raw_bytes) == raw_bytes);
+    CHECK(JsonUnescape(JsonEscape(raw_bytes)) == raw_bytes);  // 0x01 走 \u0001 往返
+
     return 0;
 }

@@ -49,14 +49,25 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     (void)dcache::JsonFindString(input, "value", v);
     (void)dcache::JsonFindBool(input, "found", b);
 
-    // 不变式：反转义的结果**一定是合法 UTF-8**。
+    // 不变式：**输入是合法 UTF-8 时**，反转义的结果也必须是合法 UTF-8。
     //
-    // 不看语义、不看具体码点，只看字节序列合法 —— 因为这是 decoder 对外唯一
-    // 说得清的承诺：你吐出来的东西，下游能当文本处理。\uD83D 单独出现、\uD800\u0041
-    // 这种假配对、截断的 \uD8，都要么合并成正确码点，要么替换成 U+FFFD，
-    // 不能编出 ED A0 xx 这种「看着像 UTF-8、RFC 3629 明令禁止」的字节。
-    const std::string unescaped = dcache::JsonUnescape(input);
-    fuzz_check::require(verify::IsValidUtf8(unescaped),
-                        "JsonUnescape 输出不是合法 UTF-8（代理区被当普通码点编码？）", input);
+    // 不看语义、不看具体码点，只看字节序列合法 —— 这是 decoder 对外说得清的
+    // 承诺。\uD83D 单独出现、\uD800\u0041 这种假配对、截断的 \uD8，都要么合并成
+    // 正确码点，要么替换成 U+FFFD，不能编出 ED A0 xx 这种「看着像 UTF-8、
+    // RFC 3629 明令禁止」的字节。
+    //
+    // 「输入合法」这个前提不是给实现让路，而是这条函数的真实契约：
+    // JsonUnescape 对非转义字节是**逐字节透传**的（缓存值可以是任意字节串，
+    // 不能因为「不像文本」就被改写）。所以喂进畸形字节、输出也跟着畸形，
+    // 那是调用方违反前提，不是解码器的错。
+    //
+    // 这条前提是第一版漏掉的：初始写法无条件断言输出合法，于是 fuzz 在
+    // 「输入里带 0xFF」这类样本上立刻红——一个恒假断言比没有断言更糟，
+    // 它会把真正的信号淹掉。第一版同时漏掉了它为什么会红。
+    if (verify::IsValidUtf8(input)) {
+        const std::string unescaped = dcache::JsonUnescape(input);
+        fuzz_check::require(verify::IsValidUtf8(unescaped),
+                            "输入是合法 UTF-8，JsonUnescape 却输出了非法 UTF-8", input);
+    }
     return 0;
 }
