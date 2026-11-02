@@ -100,7 +100,7 @@ ctest --test-dir build --output-on-failure
 bash scripts/ci.sh all     # build -> asan -> tsan -> lint -> coverage -> fuzz
 ```
 
-CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
+CI（`.github/workflows/ci.yml`）的六个常规 job 调用的就是同一份脚本，本地跑通基本等价于 CI 跑通 ——
 除了平台差异（Linux vs Windows）之外，两边不会有第二套命令。
 
 > 双远端：GitHub 为主仓（CI 跑在这里），Gitee 为国内镜像。
@@ -109,7 +109,7 @@ CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本�
 >
 > CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
-> **行覆盖率 @@COV@@**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
+> **行覆盖率 80%**（地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
 > **三个 libFuzzer 目标**（json / url / HTTP 请求行）按不变式断言跑，**首轮就撞出并修掉了
 > 一个 P0 级缺陷**：JSON 字段扫描不认字符串边界，值里出现 `"found"` 片段时会把「命中」读成「未命中」。
 > 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读；
@@ -279,12 +279,21 @@ bash scripts/ci.sh perf
 ```
 
 输出 QPS、P50/P90/P99/P999（微秒，最近秩）、`/stats`、池内空闲连接数，
-最后两行是给机器读的（下面是**真实实测**的一行，来自 CI 的压测 job）：
+最后两行是给机器读的。`RESULT` 行固定 10 个字段、脚本按列号取数，
+下面只列 **CI 注解里能核对到的字段**（`a586fb6` 的 perf job，单节点·全命中，
+QPS 与分位数是 3 轮中位数）；用 `…` 占位的是本次注解没有摘录的字段，
+**不猜、不补**——拼一行看起来完整的假输出，比少几个字段糟得多：
 
 ```
-STATS @@STATS@@
-RESULT @@RESULT@@
+STATS hit_rate=0.9848 cache_size=1000
+RESULT qps=24902 ok=… failed=… found=… n=… p50=79 p90=… p99=120 p999=134 max=…
 ```
+
+这行的 `hit_rate=0.9848` **不是「98.48% 命中」**——它看着像缓存效率不满，
+其实是**冷启动的账**：节点侧计数器从启动起累计，而每个 key 第一次被访问必然 miss。
+3 轮 × (2000 预热 + 20000 正式) = 66000 次请求，miss 恰好等于 key 空间大小
+（1000 个 key 预热时全部覆盖到了），于是 `65000/66000 = 0.9848`。
+**「全命中」指的是稳态全命中**，不是每一次都命中。
 
 **读数前必须知道的三件事**（口径写错的话，数字比没有更糟）：
 
