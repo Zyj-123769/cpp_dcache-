@@ -82,8 +82,19 @@ jobs:
         run: dpkg -s libssl-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y libssl-dev)
       - name: Install gcovr
         run: |
-          python -m pip install --user "gcovr>=6"
+          # 版本要钉住。「gcovr>=6」看着无害，实际是每次 CI 都拉当时的最新版，
+          # 而 gcovr 的解析行为在 8.x 里改过多次（遇到认不出的 gcov 输出行，
+          # 从警告变成抛异常退出）。工具版本漂移会让同一个提交两次跑出不同结果——
+          # 这不是「CI 坏了」，是「门禁的判据在变」。
+          # 8.8 是本机能装到、并用来做过解析行为实测的版本；钉它而非「最新版」，
+          # 图的是判据可复现，不是声称它比别的版本更好。
+          python -m pip install --user "gcovr==8.8"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # 版本号做成注解：数字要能被核对，工具版本也是数字的一部分。
+          # 注意两点：① GITHUB_PATH 只对**后续步骤**生效，同一步里直接写
+          # `gcovr --version` 会是 command not found（注解变空还不报错），
+          # 所以用 `python -m gcovr` 绕开 PATH；② 管道要放在 $( ) 里面。
+          echo "::notice title=gcovr::$(python -m gcovr --version 2>&1 | head -1)"
       - name: Coverage gate
         run: bash scripts/ci.sh coverage
       # 报告必须在失败时也留下来：日志要仓库权限才看得到，
@@ -105,10 +116,21 @@ jobs:
       # 再把 TOTAL 行做成一条注解。注解是唯一能用匿名 API 读到的产物：
       #   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
       - name: Coverage annotation
+        if: always()
         run: |
           if [ -f build-cov/coverage.txt ]; then
             # 日志接口要 admin 权限，页面又要人肉看——数字要能被机器取走才算可观测。
             echo "::notice title=行覆盖率::$(grep '^TOTAL' build-cov/coverage.txt | tail -1)"
+          fi
+          # 失败原因同样要能匿名读到。之前这里只在成功时有注解，
+          # 于是 coverage 一红，匿名能看到的只有「exit code 1」——
+          # 排查方向完全无从下手（和 perf job 那次踩的是同一个坑）。
+          #
+          # 两种失败要分开说：
+          #   · 有 TOTAL 但没达标 -> 门槛问题，数字本身是对的，ci.sh 已经报了注解
+          #   · 连 TOTAL 都没有   -> gcovr 阶段就炸了，原因只在它的日志里
+          if [ -f build-cov/gcovr.log ] && ! grep -q '^TOTAL' build-cov/coverage.txt 2>/dev/null; then
+            echo "::error title=coverage::$(grep -E 'ERROR|Unrecognized|Traceback|Exception during' build-cov/gcovr.log | head -3 | tr '\n' ' ' | cut -c1-800)"
           fi
 
   # libFuzzer 只随 clang 提供，gcc 侧没有等价物（AFL++ 是另一套工具链）。

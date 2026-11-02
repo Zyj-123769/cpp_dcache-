@@ -181,27 +181,77 @@ do_coverage() {
 
     log "[coverage] 统计（门槛：行覆盖率 ${COVERAGE_MIN_LINE}%）"
     local report="$dir/coverage.txt"
+    local gcovrlog="$dir/gcovr.log"
     local rc=0
-    # --root 让报告里的路径相对仓库根；--filter 只统计库本体。
-    # 用 apps/ 的入口和 tests/ 的用例给自己打分没有意义，所以排除。
-    # 注意 gcovr 在「一个文件都没匹配到」时不报错，会给一份空表（0/0）——
-    # 那看起来和「100% 覆盖」一样漂亮，所以下面必须单独判一次 TOTAL 行。
-    gcovr --root . "$dir" \
-        --filter 'src/' --filter 'include/' \
-        --exclude 'tests/' --exclude 'apps/' \
-        --txt "$report" --print-summary \
-        --fail-under-line "$COVERAGE_MIN_LINE" || rc=$?
+
+    # 这里刻意**不加** --gcov-ignore-parse-errors。理由是本批反复在守的一条：
+    # 门禁是绿的、数字是假的，比门禁红着更糟。本机用 gcovr 8.8 实测过三种设置：
+    #   · 不带豁免：gcovr 遇到无法解析的 gcov 行抛异常，退出码 64，没有报告；
+    #   · 具体值（negative_hits.warn 等，须重复传参、不能逗号分隔）：
+    #     能消化负命中/大计数，但遇到「认不出的行类型」仍抛异常；
+    #   · all：所有错误都放行，文件还在报告里，可坏行被**静默吞掉**——
+    #     那些行不进分母，覆盖率会被悄悄抬高，而且没有任何报错。
+    # 所以宁可让偶发的工具缺陷把 job 弄红并说明原因，也不换一个假绿。
+    #
+    # 处理偶发的方式是**重跑**，不是豁免：清掉 .gcda、重跑一遍 ctest、再统计。
+    # 重跑不改变任何计数口径，数字依然可核对；而豁免会。
+    # 只重跑一轮：真要是确定性的解析缺陷，多跑几轮也一样红，白耗时间。
+    local attempt=1
+    while :; do
+        rc=0
+        # 上一轮若在写报告前就抛了异常，可能留下半份旧文件；先清掉，
+        # 否则下面的 TOTAL 校验会拿旧数字放行，又是一处静默假数字。
+        rm -f "$report"
+        gcovr --root . "$dir" \
+            --filter 'src/' --filter 'include/' \
+            --exclude 'tests/' --exclude 'apps/' \
+            --txt "$report" --print-summary \
+            --fail-under-line "$COVERAGE_MIN_LINE" 2>&1 | tee "$gcovrlog" || rc=${PIPESTATUS[0]}
+
+        # 只有「解析错误」值得重跑；门槛未达或参数错误重跑没有意义。
+        local parse_failed=0
+        if grep -qE 'Unrecognized GCOV output for|Exiting because of parse errors' "$gcovrlog" 2>/dev/null; then
+            parse_failed=1
+        fi
+
+        if [ "$parse_failed" -eq 1 ]; then
+            # 匿名通道上次只看到「Exception during parsing:」——异常类型名被
+            # 截断在下一行，害得只能靠猜。这里把类型名一起发出来：
+            # NegativeHits / SuspiciousHits / UnknownLineType 对应三种不同修法。
+            report warning "[coverage] 第 ${attempt} 轮遇到 gcov 解析错误" \
+                "$(grep -E 'Unrecognized GCOV output for|NegativeHits|SuspiciousHits|UnknownLineType|Exception during' "$gcovrlog" | head -4 | tr '\n' ' ' | cut -c1-800)"
+        fi
+
+        if [ "$parse_failed" -eq 0 ] || [ "$attempt" -ge 2 ]; then
+            break
+        fi
+
+        attempt=$((attempt + 1))
+        log "[coverage] 解析错误，清 .gcda 重跑第 ${attempt} 轮（计数口径不变）"
+        find "$dir" -name '*.gcda' -delete
+        if ! ctest --test-dir "$dir" --output-on-failure 2>&1 | tee "$dir/ctest-retry.log"; then
+            report error "[coverage] 重跑测试失败" \
+                "$(grep -E 'FAILED|Failed|\*\*\*' "$dir/ctest-retry.log" | head -5 | tr '\n' ' ' || echo '没有匹配到失败行')"
+            return 1
+        fi
+    done
 
     if ! grep -q '^TOTAL' "$report" 2>/dev/null; then
         echo "覆盖率报告里没有 TOTAL 行：--filter 没匹配到任何被插桩的源文件。" >&2
         echo "常见原因：没加 --coverage（.gcda 不存在）、测试没跑、或构建目录传错。" >&2
         echo "这种情况一律按失败处理，不要当成通过。" >&2
+        # 失败原因也要能匿名读到：日志要 admin 权限。
+        report error "[coverage] 报告里没有 TOTAL 行" \
+            "$(grep -E 'ERROR|Unrecognized|Traceback|Exception' "$dir/gcovr.log" 2>/dev/null | head -3 | tr '\n' ' ' || echo '没有匹配到 gcovr 错误行')"
         return 1
     fi
 
     if [ "$rc" -ne 0 ]; then
         echo "覆盖率未达门槛：行覆盖率低于 ${COVERAGE_MIN_LINE}%（明细：${report}）。" >&2
         echo "两条路：补测试把数字抬上去，或确属合理下调时显式改 COVERAGE_MIN_LINE 并写明理由。" >&2
+        # 同上：失败原因不能只写在日志里。
+        report error "[coverage] 未达门槛" \
+            "$(grep '^TOTAL' "$report" 2>/dev/null | tail -1) （门槛 ${COVERAGE_MIN_LINE}%）"
         return "$rc"
     fi
 
