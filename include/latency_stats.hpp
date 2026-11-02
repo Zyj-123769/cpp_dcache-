@@ -102,10 +102,10 @@ inline std::int64_t LatencyStats::Permille(int permille) const {
     if (rank < 1) {
         rank = 1;  // p=0 时 ceil 算出 0，夹到第一个样本（即最小值）
     }
-    if (rank >= n) {
-        rank = n - 1;  // 反证用：把「0-based 下标当 1-based 秩」的写法夹回界内
+    if (rank > n) {
+        rank = n;  // 防御：p=1000 时理论上等于 n，但仍夹一次，免得将来改公式越界
     }
-    return samples_[rank];
+    return samples_[rank - 1];
 }
 
 inline std::int64_t LatencyStats::Percentile(int percent) const {
