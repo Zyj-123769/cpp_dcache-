@@ -166,9 +166,22 @@ void Node::ServeHTTP(const HttpRequest& req, HttpResponse& resp) {
         }
 
         if (pool_->IsTrustedRequest(req.remote_ip, token)) {
-            const int parsed = std::atoi(hops_it->second.c_str());
-            hops = parsed < 0 ? 0
-                              : (parsed > Group::kMaxForwardHops ? Group::kMaxForwardHops : parsed);
+            // 用 strtol 而不是 atoi：atoi 溢出是未定义行为，而这个头的值来自网络。
+            //
+            // 说实话这一行原本也不会出事：下面的夹取会把任何结果压进
+            // [0, kMaxForwardHops]，包括 UB 之后那个「不知道是什么」的返回值。
+            // 但「靠下游夹住上游的未定义行为」不该是设计——真正的防线应该是
+            // 这一行自己就没有 UB，夹取只负责业务语义。
+            char* end          = nullptr;
+            const long parsed  = std::strtol(hops_it->second.c_str(), &end, 10);
+            const bool numeric = (end != hops_it->second.c_str()) && (*end == '\0');
+            if (!numeric || parsed < 0) {
+                hops = 0;
+            } else if (parsed > Group::kMaxForwardHops) {
+                hops = Group::kMaxForwardHops;
+            } else {
+                hops = static_cast<int>(parsed);
+            }
         } else {
             // 有人带着内部语义头来但过不了校验：按 hops=0 处理（等价外部客户端），
             // 同时记账。这类伪造尝试在访问日志里看不出任何异常，只能靠计数器暴露。

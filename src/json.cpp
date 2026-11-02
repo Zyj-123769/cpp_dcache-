@@ -57,6 +57,10 @@ bool find_after_key(const std::string& body, const std::string& key, std::size_t
     return false;
 }
 
+// U+D800..U+DFFF 是 UTF-16 的代理区，本身不是字符。JSON 用它拼出 BMP 外的码点，
+// 单独出现时按 JSON 生态的通行做法（WHATWG、多数语言的标准库）替换成 U+FFFD。
+constexpr unsigned int kReplacementChar = 0xFFFD;
+
 int hex_digit(char c) {
     if (c >= '0' && c <= '9')
         return c - '0';
@@ -65,6 +69,28 @@ int hex_digit(char c) {
     if (c >= 'A' && c <= 'F')
         return c - 'A' + 10;
     return -1;
+}
+
+// 读 s[pos..pos+3] 这 4 个十六进制位。越界或含非十六进制字符时返回 false，
+// 且不碰 out —— 调用方据此决定是「原样保留」还是「当孤立代理替换」。
+//
+// 边界写死在这里而不是让调用方各自 +4：代理对要连续做两次这种读取，
+// 而第二次的起点是算出来的，一处算错就是越界读（ASan 只有在恰好撞到
+// 页尾时才报）。
+bool parse_hex4(const std::string& s, std::size_t pos, unsigned int& out) {
+    if (pos + 3 >= s.size()) {  // 需要 pos .. pos+3 全部可读
+        return false;
+    }
+    unsigned int v = 0;
+    for (std::size_t k = 0; k < 4; ++k) {
+        const int d = hex_digit(s[pos + k]);
+        if (d < 0) {
+            return false;
+        }
+        v = v * 16 + static_cast<unsigned int>(d);
+    }
+    out = v;
+    return true;
 }
 
 // 把 Unicode 码点编码为 UTF-8（保留 4 字节路径，兼容外部报文的高位码点）。
@@ -161,25 +187,39 @@ std::string JsonUnescape(const std::string& s) {
             out += '\f';
             break;
         case 'u': {
-            if (i + 4 < s.size()) {
-                int code = 0;
-                bool ok  = true;
-                for (int k = 1; k <= 4; ++k) {
-                    int d = hex_digit(s[i + k]);
-                    if (d < 0) {
-                        ok = false;
-                        break;
-                    }
-                    code = code * 16 + d;
-                }
-                if (ok) {
-                    append_utf8(out, static_cast<unsigned int>(code));
-                    i += 4;
-                    break;
-                }
+            // \uXXXX 转义的是一个 UTF-16 **码元**，不是码点。这两者只对 BMP 内的
+            // 字符等价；BMP 外的字符（emoji、部分生僻字）在报文里是一对代理：
+            // 😀 = U+1F600 = \uD83D\uDE00。
+            unsigned int code = 0;
+            if (!parse_hex4(s, i + 1, code)) {
+                // 不是合法的 \uXXXX（太短或有非十六进制字符）：原样保留两个字符。
+                // 不在这里判畸形，是为了让「畸形报文」的责任留在上层的字段解析，
+                // 这个函数只负责转义。
+                out += '\\';
+                out += 'u';
+                break;
             }
-            out += '\\';
-            out += 'u';
+            i += 4;  // 指向 4 个十六进制位中的最后一位，外层 ++i 正好跨过 \uXXXX
+
+            // 关键：0xD83D 必须和后面的 0xDE00 合并成 0x1F600，再走四字节分支。
+            // 旧实现把 0xD83D 当普通码点编，走的是「三字节」分支，产出 ED A0 BD ——
+            // 这是把 UTF-16 码元当码点编码的经典错误（CESU-8），而 RFC 3629
+            // 禁止把 U+D800..U+DFFF 编进 UTF-8 字节流。对端拿到的是非法字节，
+            // 下游 JSON 解析器通常直接判报文畸形。
+            if (code >= 0xD800 && code <= 0xDBFF) {
+                // 高代理：向后偷看一个 \uXXXX，是低代理就合并，否则自己作废。
+                unsigned int low = 0;
+                if (i + 2 < s.size() && s[i + 1] == '\\' && s[i + 2] == 'u' &&
+                    parse_hex4(s, i + 3, low) && low >= 0xDC00 && low <= 0xDFFF) {
+                    code = 0x10000u + ((code - 0xD800u) << 10) + (low - 0xDC00u);
+                    i += 6;  // 第二个 \uXXXX 也吃掉了
+                } else {
+                    code = kReplacementChar;
+                }
+            } else if (code >= 0xDC00 && code <= 0xDFFF) {
+                code = kReplacementChar;  // 低代理单独出现：没有高代理可与它配对
+            }
+            append_utf8(out, code);
             break;
         }
         default: {

@@ -24,12 +24,22 @@ bool split_addr(const std::string& addr, std::string& host, std::uint16_t& port)
     if (colon == std::string::npos || colon == 0 || colon + 1 >= addr.size()) {
         return false;
     }
-    host  = addr.substr(0, colon);
-    int p = std::atoi(addr.substr(colon + 1).c_str());
-    if (p <= 0 || p > 65535) {
+
+    // 端口用 strtol 而不是 atoi：atoi 在溢出时是未定义行为（C 标准根本没规定
+    // 返回值），而这里的输入来自 --peers，是人手写的配置。strtol 溢出会饱和到
+    // LONG_MAX/LONG_MIN，必然落在下面的区间检查之外 —— 所以不用看 errno。
+    //
+    // 比 atoi 严格的地方：要求整段都是数字。"8000abc" 这种以前会被当成 8000，
+    // 现在直接判失败；配置写错应该在启动时炸，而不是安静地用一个猜出来的端口。
+    const char* const begin = addr.c_str() + colon + 1;
+    char* end               = nullptr;
+    const long parsed       = std::strtol(begin, &end, 10);
+    if (end == begin || *end != '\0' || parsed <= 0 || parsed > 65535) {
         return false;
     }
-    port = static_cast<std::uint16_t>(p);
+
+    host = addr.substr(0, colon);
+    port = static_cast<std::uint16_t>(parsed);
     return true;
 }
 

@@ -1,5 +1,7 @@
 #include "group.hpp"
 
+#include <utility>
+
 #include "hash.hpp"
 #include "peer_pool.hpp"
 
@@ -24,7 +26,12 @@ GetResult Group::Get(const std::string& key, int hops) {
             std::lock_guard<std::mutex> lk(stats_mtx_);
             ++stats_.local_hit;
         }
-        return *cached;
+        // 必须写 std::move：cached 是非 const 左值，直接 return *cached 会走拷贝
+        // 构造，把 value 和 error 两个字符串再复制一遍。这是命中路径上第二次
+        // 拷贝（第一次在 LruCache::get 里，那次是出锁所必需的），而这一次纯属浪费。
+        //
+        // 安全性：cached 是局部变量，move 之后不再使用，也没有别名指向它。
+        return std::move(*cached);
     }
 
     {
