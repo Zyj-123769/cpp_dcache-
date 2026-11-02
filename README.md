@@ -109,12 +109,12 @@ CI（`.github/workflows/ci.yml`）的六个 job 调用的就是同一份脚本�
 >
 > CI 状态：六个 job（build / asan+ubsan / tsan / lint / coverage / fuzz）已全部实跑通过。
 > ASan、UBSan、TSan 零报告；`clang-format` 全仓零 diff；
-> **行覆盖率 79%**（2242 行中 1771 行，地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
+> **行覆盖率 79%**（2261 行中 1806 行，地板值 75%，`--coverage` + `gcovr`，统计 `src/` 与 `include/`）；
 > **三个 libFuzzer 目标**（json / url / HTTP 请求行）按不变式断言跑，**首轮就撞出并修掉了
 > 一个 P0 级缺陷**：JSON 字段扫描不认字符串边界，值里出现 `"found"` 片段时会把「命中」读成「未命中」。
 > 首跑记录见 `docs/REVIEW_REPORT-2026-11-01.md` 第十一节 —— 那次全红，值得一读；
 > fuzz 那一轮见第十三节，**节点间 TLS** 见第十四节，
-> **慢客户端隔离**（先红后绿）见第十六节。
+> **慢客户端隔离**（先红后绿）见第十六节，**`\uXXXX` 代理对**见第十七节。
 > 9 个测试二进制（含 7 组 TLS 用例，其中 3 组断言的是「必须失败」）。
 
 
@@ -261,7 +261,7 @@ curl http://127.0.0.1:8001/api/scores/k1
 | `test_lru_cache` | 命中 / 未命中 / 更新 / 容量淘汰 / TTL 惰性过期 / 容量 0 / 并发读写 |
 | `test_consistent_hash` | 确定性路由、节点分布均衡、新增节点迁移比例 ≤ 2/N、删除 / 空环 |
 | `test_singleflight` | 100 并发同一 key 只回源 1 次、共享结果、无 inflight 泄漏、异常传播（leader 抛异常 → 等待者拿到异常而非死锁） |
-| `test_json` | 转义往返、控制字符 `\u00XX` 及高位码点 UTF-8 编解码、非法输入安全失败 |
+| `test_json` | 转义往返、控制字符 `\u00XX`、**代理对合并（`\uD83D\uDE00` → 4 字节）与孤立代理替换 U+FFFD**、代理区两侧边界（D7FF/E000）、非转义字节逐字节透传、非法输入安全失败 |
 | `test_url` | 百分号编码/解码往返、特殊字符、非法序列原样保留 |
 | `test_node` | 单机本地命中 + 回源一次 + 空值缓存防穿透；极小 TTL(1/2/3ms) 边界；并发防击穿；双节点 HTTP 转发回填；handler 抛异常→500 且进程存活；Stop→Start 重启可用；移除节点后 vnode 数不变；对端报错不写负缓存且映射为 503；发完立刻 FIN 仍能收到响应；超大 Content-Length 立即断开；keep-alive 同连接第二条请求仍被服务；伪造 `X-DCache-Hops` 被拒并记账；`/metrics` 格式与取值；token 比较语义；连接池复用生效与开关 |
 
