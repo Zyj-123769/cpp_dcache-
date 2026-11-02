@@ -134,6 +134,13 @@ start_cluster() {
     return 1
 }
 
+# RESULT 行应有 10 列：qps ok failed found n p50 p90 p99 p999 max。
+# 下面按列号取数（p50=第 6 列…），所以列数必须先验一遍——
+# 否则 RESULT 行少一个字段，后面所有列都会**静默错位**：
+# cut 取不到的那列会输出空行，sort -n 把它当 0，
+# 于是报告里出现一个「P50 = 0µs」的假数字，而且没有任何报错。
+RESULT_COLS=10
+
 # 中位数。样本量是 REPS（默认 3），偶数取中间两个的均值。
 median_of() {  # $1 = 列号，stdin = TSV
     cut -f"$1" | sort -n | awk '
@@ -184,6 +191,26 @@ run_config() {
         # 所以 bench 里那行的字段顺序是契约，改它就得同步改这里。
         awk '/^RESULT/ { for (i = 2; i <= NF; i++) { split($i, kv, "="); printf "%s%s", (i > 2 ? "\t" : ""), kv[2] } print "" }' \
             "$TMP/bench-$label-$rep.log" >>"$out"
+
+        # 每轮都必须产出一行 RESULT，且每行都得是 10 列。
+        # 少一列说明 bench 的 RESULT 格式变了，继续往下算只会得到一组
+        # 看起来正常、其实整体错位的数字；少一行说明某轮 bench 没吐出结果，
+        # 而那轮的失败会被中位数悄悄吸收掉。
+        local rows bad
+        rows=$(wc -l <"$out")
+        if [ "$rows" -ne "$REPS" ]; then
+            echo "BENCH_FAILED [$label] 只收到 ${rows} 行 RESULT，应为 ${REPS} 行" >&2
+            echo "  bench 输出尾部：" >&2
+            tail -8 "$TMP/bench-$label-$rep.log" >&2
+            return 1
+        fi
+        bad=$(awk -F '\t' 'NF != '"$RESULT_COLS"' { print "第 " NR " 行有 " NF " 列"; exit }' "$out")
+        if [ -n "$bad" ]; then
+            echo "BENCH_FAILED [$label] RESULT 行格式不对：${bad}（应为 ${RESULT_COLS} 列）" >&2
+            echo "  bench 输出尾部：" >&2
+            tail -8 "$TMP/bench-$label-$rep.log" >&2
+            return 1
+        fi
     done
 
     # 列顺序：qps ok failed found n p50 p90 p99 p999 max
@@ -192,6 +219,16 @@ run_config() {
     p50=$(median_of 6 <"$out")
     p99=$(median_of 8 <"$out")
     p999=$(median_of 9 <"$out")
+
+    # 空值不能当 0 报出去。「P50 = 0µs」比「没有 P50」糟糕得多：
+    # 前者看起来像一个极快的测量结果。
+    local v
+    for v in "$qps" "$p50" "$p99" "$p999"; do
+        if [ -z "$v" ] || [ "$v" = "NA" ]; then
+            echo "BENCH_FAILED [$label] 延迟分位数取不到值（列顺序与 bench 的 RESULT 行不匹配？）" >&2
+            return 1
+        fi
+    done
 
     # 节点侧计数器只取最后一轮。它是**节点自启动以来的累计值**，包含预热和
     # 之前几轮 —— 所以只能当「这份配置下的命中率量级」看，不能当成某一轮的值。
