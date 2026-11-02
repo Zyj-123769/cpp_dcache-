@@ -243,31 +243,50 @@ run_config() {
             tail -5 "$TMP/bench-$label-$rep.log" >&2
             return 1
         fi
+        # 本轮必须产出**恰好一行** RESULT。
+        #
+        # 注意这一段曾经写错过：行数校验放在了循环**内部**，而且比的是
+        # 「累计行数 == REPS」。于是第 1 轮刚结束时累计只有 1 行，
+        # 1 != 3 直接报错退出——四个配置全部报「只收到 1 行 RESULT」。
+        # 正确的切法是：**循环内只看本轮产出，循环后再看总数。**
+        local added
+        added=$(awk '/^RESULT/ { n++ } END { print n+0 }' "$TMP/bench-$label-$rep.log")
+        if [ "$added" -ne 1 ]; then
+            bench_failed "[$label] 第 ${rep} 轮 bench 产出 ${added} 行 RESULT（应为 1 行）"
+            echo "  bench 输出尾部：" >&2
+            tail -8 "$TMP/bench-$label-$rep.log" >&2
+            return 1
+        fi
+
         # 把 RESULT 行转成 TSV。字段顺序由 bench 决定，这里按位置取——
         # 所以 bench 里那行的字段顺序是契约，改它就得同步改这里。
         awk '/^RESULT/ { for (i = 2; i <= NF; i++) { split($i, kv, "="); printf "%s%s", (i > 2 ? "\t" : ""), kv[2] } print "" }' \
             "$TMP/bench-$label-$rep.log" >>"$out"
 
-        # 每轮都必须产出一行 RESULT，且每行都得是 10 列。
-        # 少一列说明 bench 的 RESULT 格式变了，继续往下算只会得到一组
-        # 看起来正常、其实整体错位的数字；少一行说明某轮 bench 没吐出结果，
-        # 而那轮的失败会被中位数悄悄吸收掉。
-        local rows bad
-        rows=$(wc -l <"$out")
-        if [ "$rows" -ne "$REPS" ]; then
-            bench_failed "[$label] 只收到 ${rows} 行 RESULT，应为 ${REPS} 行"
-            echo "  bench 输出尾部：" >&2
-            tail -8 "$TMP/bench-$label-$rep.log" >&2
-            return 1
-        fi
-        bad=$(awk -F '\t' 'NF != '"$RESULT_COLS"' { print "第 " NR " 行有 " NF " 列"; exit }' "$out")
-        if [ -n "$bad" ]; then
-            bench_failed "[$label] RESULT 行格式不对：${bad}（应为 ${RESULT_COLS} 列）"
+        # 列数必须是 10。少一列说明 bench 的 RESULT 格式变了，继续往下算
+        # 只会得到一组看起来正常、其实整体错位的数字。
+        #
+        # 注意检查的对象是**转换后的 TSV 行**，不是 bench 的原始输出——
+        # 原始那行是空格分隔的（RESULT qps=1 ok=2 ...），拿 tab 去切它
+        # 永远只有一列，于是每轮都会误报「1 列 ≠ 10 列」。
+        local cols
+        cols=$(tail -1 "$out" | awk -F '\t' '{ print NF; exit }')
+        if [ "$cols" != "$RESULT_COLS" ]; then
+            bench_failed "[$label] 第 ${rep} 轮 RESULT 行有 ${cols:-0} 列（应为 ${RESULT_COLS} 列）"
             echo "  bench 输出尾部：" >&2
             tail -8 "$TMP/bench-$label-$rep.log" >&2
             return 1
         fi
     done
+
+    # 全部轮次跑完之后，总行数必须正好等于轮数。
+    # 少一轮说明那一轮的结果被中位数悄悄吸收掉了。
+    local rows
+    rows=$(wc -l <"$out")
+    if [ "$rows" -ne "$REPS" ]; then
+        bench_failed "[$label] 共收到 ${rows} 行 RESULT，应为 ${REPS} 行"
+        return 1
+    fi
 
     # 列顺序：qps ok failed found n p50 p90 p99 p999 max
     local qps p50 p99 p999
