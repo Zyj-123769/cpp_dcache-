@@ -364,14 +364,20 @@ int main(int argc, char** argv) {
     const auto t1       = std::chrono::steady_clock::now();
 
     const double secs = std::chrono::duration<double>(t1 - t0).count();
-    const double qps  = secs > 0 ? static_cast<double>(r.ok) / secs : 0.0;
+    // QPS 的分子**只算成功请求**，而分母是全部请求耗掉的时间：
+    // 失败请求也占了时间（超时那次是整整一个 timeout），却不计入分子。
+    // 这是个保守的选择——失败率越高，QPS 越低，而不是越高。
+    // 但口径必须写出来，否则「QPS=48000、失败率 2%」会被读成
+    // 「服务每秒处理了 48000 个请求」，而它处理的是 48000 个**成功**的。
+    const double qps = secs > 0 ? static_cast<double>(r.ok) / secs : 0.0;
     const double found_rate =
         r.ok > 0 ? static_cast<double>(r.found) / static_cast<double>(r.ok) : 0.0;
 
     std::cout << "\n====== 压测结果 ======\n";
     std::cout << "ok / failed: " << r.ok << " / " << r.failed << "\n";
     std::cout << "elapsed    : " << std::fixed << std::setprecision(3) << secs << " s\n";
-    std::cout << "QPS        : " << std::fixed << std::setprecision(0) << qps << "\n";
+    std::cout << "QPS(成功)  : " << std::fixed << std::setprecision(0) << qps
+              << "  （分子只算成功请求，分母是全部请求耗时）\n";
     std::cout << "found 占比 : " << std::fixed << std::setprecision(3) << found_rate << "\n";
     if (r.undecodable > 0) {
         // 服务端回了 200 但 body 解析不了 —— 那是协议层的问题，不该混进命中率里沉默。
