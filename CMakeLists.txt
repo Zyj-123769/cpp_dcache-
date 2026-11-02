@@ -127,7 +127,8 @@ set(DCACHE_TESTS
     test_url
     test_http_parser
     test_node
-    test_worker_isolation)
+    test_worker_isolation
+    test_latency_stats)
 
 # TLS 测试要自己签发证书（用 OpenSSL API，不依赖 openssl 命令行），
 # 因此只在 DCACHE_TLS=ON 时存在。

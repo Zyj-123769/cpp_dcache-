@@ -2,8 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    # perf/** 是压测分支：推一个这样的分支就等于「我要一份性能数据」。
+    # 有了它就不必依赖 workflow_dispatch —— 后者要用带 token 的 API 或页面点，
+    # 而「怎么触发」本身不该成为复现实验的门槛。
+    branches: [ main, master, 'perf/**' ]
   pull_request:
+  # 压测只在手动触发时跑（见文件末尾的 perf job）。
+  workflow_dispatch:
 
 # 构建命令全部收在 scripts/ci.sh 里，这里只声明「在哪个 runner 上跑哪一项」。
 # 换 CI 平台时（Gitee Go / 云效 / Jenkins），改的是这一层的方言，脚本不动。
@@ -141,3 +146,52 @@ jobs:
           echo "::notice title=clang::$( (clang++ --version 2>&1 | head -1) || echo MISSING)"
       - name: Build & run fuzzers
         run: bash scripts/ci.sh fuzz
+
+  # 性能数据刻意**不进** push / PR 流水线，两个理由：
+  #   1. 共享 runner 的 vCPU 会被邻居抢，同一个提交两次跑能差 20%。放进每次 PR
+  #      只会训练大家忽略这个数字，那比没有数字更糟。
+  #   2. 它要跑 3 套配置 × 3 轮，比其余六个 job 加起来还慢。
+  #
+  # 结果走注解：和覆盖率同一条通道，匿名 API 就能取——
+  #   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
+  # 注解里必须带上是共享 runner 这件事。单独一个 "p99=95us" 会被读成
+  # 「这台机器上能跑 95us」，而它只是「这台共享机器、这一刻、没被邻居挤」。
+  perf:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/heads/perf/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # 节点间 TLS 需要 OpenSSL 头文件。镜像里通常已有，但「通常」不是保证
+      # （ubuntu-latest 正在往 26 迁，装了什么会变），所以缺了就直接装，不靠猜。
+      - name: Ensure libssl-dev
+        run: dpkg -s libssl-dev >/dev/null 2>&1 || (sudo apt-get update && sudo apt-get install -y libssl-dev)
+      - name: Build & benchmark
+        # 入口和本地完全一致（scripts/ci.sh perf）：构建参数、集群参数、轮次
+        # 都收在脚本里，这一层只负责「在哪台机器上跑」。
+        # pipefail：`| tee` 会把脚本的退出码吞掉，不加这一句的话
+        # 「集群没起来」在页面上看起来和成功一模一样。
+        run: |
+          set -o pipefail
+          bash scripts/ci.sh perf 2>&1 | tee perf.log
+      - name: Results
+        if: always()
+        run: |
+          if [ ! -f perf.log ]; then
+            echo "没有 perf.log（构建或压测阶段就失败了）"
+            echo "没有生成 perf.log" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo '### 压测（GitHub 共享 runner）'
+            echo ''
+            echo '> 绝对 QPS 不可迁移：共享 vCPU 会被邻居抢占。同一提交重复跑也会漂。'
+            echo '> 能看的是**同一份报告内部**的相对差异（全命中 vs 会淘汰、单节点 vs 三节点）。'
+            echo ''
+            echo '```'
+            grep -E '^(os|cpu|reps|----|     qps)' perf.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep '^BENCH_SUMMARY' perf.log | while IFS= read -r line; do
+            echo "::notice title=bench::${line#BENCH_SUMMARY }"
+          done

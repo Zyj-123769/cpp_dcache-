@@ -14,6 +14,7 @@
 #   scripts/ci.sh lint    clang-format 格式检查 + clang-tidy 静态分析
 #   scripts/ci.sh coverage  --coverage 插桩 + gcovr 统计，行覆盖率低于门槛即失败
 #   scripts/ci.sh fuzz      libFuzzer 跑 json / url / HTTP 解析器（需 clang）
+#   scripts/ci.sh perf      起集群跑压测，输出 QPS 与 P50/P99/P999（不在 all 里）
 #   scripts/ci.sh all     依次执行上面六项
 #
 # 环境变量：
@@ -280,6 +281,17 @@ do_fuzz() {
     return "$rc"
 }
 
+# 压测。**不在 `all` 里**，两个理由：
+#   1. 它耗时且数字依赖机器，放进每次 PR 只会训练大家忽略这个数字；
+#   2. 它要求「优化过的二进制」，而 asan/tsan/coverage 三种构建都不是为性能准备的。
+# 所以单独一个入口：本地和 CI 跑的是同一份 scripts/bench_perf.sh。
+do_perf() {
+    log "[perf] Release 构建（压测必须在 -O2 上跑，Debug 的数字没有意义）"
+    cmake -S . -B build-perf -DCMAKE_BUILD_TYPE=Release >/dev/null
+    cmake --build build-perf -j"$JOBS" >/dev/null
+    BINDIR=build-perf bash scripts/bench_perf.sh
+}
+
 # 依赖探针：把 TLS 后端版本打成注解。
 # 和 fuzz 那次同一个理由——「TLS 已启用」如果只写在文档里，就没有任何人能核实。
 # 本地跑时 report 直接返回，不会污染终端。
@@ -296,6 +308,7 @@ case "${1:-}" in
     lint)  do_lint ;;
     coverage) do_coverage ;;
     fuzz) do_fuzz ;;
+    perf) do_perf ;;
     all)
         do_build
         do_asan
@@ -305,7 +318,7 @@ case "${1:-}" in
         do_fuzz
         ;;
     *)
-        echo "用法: $0 <build|asan|tsan|lint|coverage|fuzz|all>" >&2
+        echo "用法: $0 <build|asan|tsan|lint|coverage|fuzz|perf|all>" >&2
         exit 2
         ;;
 esac
