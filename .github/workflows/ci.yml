@@ -195,3 +195,9 @@ jobs:
           grep '^BENCH_SUMMARY' perf.log | while IFS= read -r line; do
             echo "::notice title=bench::${line#BENCH_SUMMARY }"
           done
+          # 失败原因也走注解。日志要 admin 权限才看得到，而 job summary 页面要人肉翻——
+          # perf 失败过一次，匿名 API 只能看到一个「exit code 1」，原因完全无从下手。
+          # 这一层是兜底：bench_perf.sh 自己也会发注解，但构建失败等路径走不到那里。
+          grep -E '^(BENCH_FAILED|节点在|提示：)' perf.log | head -6 | while IFS= read -r line; do
+            echo "::error title=perf-log::${line}"
+          done

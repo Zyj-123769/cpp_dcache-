@@ -287,9 +287,23 @@ do_fuzz() {
 # 所以单独一个入口：本地和 CI 跑的是同一份 scripts/bench_perf.sh。
 do_perf() {
     log "[perf] Release 构建（压测必须在 -O2 上跑，Debug 的数字没有意义）"
-    cmake -S . -B build-perf -DCMAKE_BUILD_TYPE=Release >/dev/null
-    cmake --build build-perf -j"$JOBS" >/dev/null
-    BINDIR=build-perf bash scripts/bench_perf.sh
+    if ! cmake -S . -B build-perf -DCMAKE_BUILD_TYPE=Release >/dev/null; then
+        report "error" "perf" "构建目录配置失败（cmake configure）"
+        return 1
+    fi
+    # 构建输出不丢：cmake 的编译错误打在 stdout 上，`>/dev/null` 会把它吞掉，
+    # 于是「构建失败」和「构建成功但压测失败」在日志里长得一模一样。
+    if ! cmake --build build-perf -j"$JOBS"; then
+        report "error" "perf" "Release 构建失败（编译错误见上一段输出）"
+        return 1
+    fi
+    if ! BINDIR=build-perf bash scripts/bench_perf.sh; then
+        # 具体原因由 bench_perf.sh 自己发成注解（它知道哪一环失败）；
+        # 这里只补一条总览，免得失败时一条注解都没有。
+        report "error" "perf" "压测脚本失败；逐条原因见本 job 的 perf / node-log 注解"
+        return 1
+    fi
+    return 0
 }
 
 # 依赖探针：把 TLS 后端版本打成注解。

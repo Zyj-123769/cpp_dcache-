@@ -94,7 +94,7 @@ void usage(const char* argv0) {
               << " [options]\n"
                  "  --target <host:port>   目标节点地址 (默认 127.0.0.1:8001)\n"
                  "  --group <name>         缓存分组名 (默认 scores)\n"
-                 "  --threads <n>          并发线程数 (默认 2，与 CI runner 的 vCPU 数一致)\n"
+                 "  --threads <n>          并发线程数 (默认 2，与压测脚本一致)\n"
                  "  --requests <n>         测量阶段的请求数，不含预热 (默认 20000)\n"
                  "  --keys <n>             随机 key 空间大小 (默认 1000)\n"
                  "  --warmup <n>           预热请求数，不计入统计 (默认 requests/10)\n"

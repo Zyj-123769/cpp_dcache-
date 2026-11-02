@@ -99,7 +99,7 @@ make_cert() {
 }
 
 start_cluster() {
-    local count=$1
+    local count=$1 transport=${2:-tcp}
     local peers=""
     local i port
     for i in $(seq 1 "$count"); do
@@ -121,17 +121,72 @@ start_cluster() {
         NODE_PIDS+=("$!")
     done
 
-    # 等端口真的能应答。sleep 固定秒数在慢 runner 上会假失败，快机器上又白等。
+    # 等节点真的能应答。sleep 固定秒数在慢 runner 上会假失败，快机器上又白等。
+    #
+    # **探针必须和被测服务用同一种协议。** 这里的 TLS 配置最初就是踩了这个坑：
+    # 探针写的是明文 `http://`，而节点在 TLS 模式下监听的是 TLS 端口，
+    # 明文请求必然被握手拒绝 —— 于是脚本判定「节点没起来」，可节点好好地在那儿。
+    # 表现是 perf job 直接红掉，而原因只写在日志里（匿名看不到）。
     local probe="127.0.0.1:$BASE_PORT"
-    for _ in $(seq 1 100); do
-        if curl -s -m 1 -o /dev/null "http://$probe/stats"; then
-            return 0
+    local i_try
+    for i_try in $(seq 1 100); do
+        if [ "$transport" = "tls" ]; then
+            curl -s -m 1 -o /dev/null --cacert "$CERT_PEM" "https://$probe/stats" && return 0
+        else
+            curl -s -m 1 -o /dev/null "http://$probe/stats" && return 0
         fi
         sleep 0.1
     done
-    echo "节点在 10 秒内没起来，日志：" >&2
+
+    # 探针失败**不等于**「节点没起来」。先看端口在不在监听：
+    #   端口通 → 协议层的问题（TLS 握手 / 证书校验 / SAN 不匹配）。
+    #           继续往下压，让 bench 用项目自己的 TLS 栈给出更准确的报错——
+    #           探针只是「进程起来了没有」的判据，它对证书的理解不该是唯一真相。
+    #   端口不通 → 节点确实没起来，把节点日志打出来。
+    if (exec 3<>"/dev/tcp/127.0.0.1/$BASE_PORT") 2>/dev/null; then
+        exec 3<&- 2>/dev/null
+        echo "提示：端口在监听，但 HTTP(S) 健康检查没通过 —— 更像是协议层问题" >&2
+        echo "      （TLS 握手 / 证书校验 / 证书 SAN 不匹配），不是节点没起来。" >&2
+        echo "      继续压测；若失败请看 bench 输出的具体报错。" >&2
+        return 0
+    fi
+
+    echo "节点在 10 秒内没起来（端口也没在监听），日志：" >&2
     cat "$TMP"/node-*.log >&2
     return 1
+}
+
+# 压测失败时把原因发成 GitHub 注解。
+#
+# 为什么必须自带这条通道：job 的日志要仓库 admin 权限才看得到，
+# 而 job summary 页面要人肉翻。perf 失败过一次，原因（探针用了明文 HTTP
+# 打 TLS 端口）只写在日志里，匿名 API 只能看到一个「exit code 1」——
+# 排查方向完全无从下手。注解是唯一能匿名读到的产物。
+bench_failed() {
+    local msg=$1
+    echo "BENCH_FAILED $msg" >&2
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '::error title=perf::%s\n' \
+            "$(printf '%s' "$msg" | tr '\n' ' ' | cut -c1-900)"
+    fi
+}
+
+# 节点日志的关键几行。节点启动失败的原因（比如 TLS 参数不成组、证书读不了）
+# 只在节点自己的 stderr 里，不带出来就等于没报。
+report_node_log() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    local f n=0
+    for f in "$TMP"/node-*.log; do
+        [ -f "$f" ] || continue
+        # 注解条数有上限（每次 check run 50 条），所以只看前两个节点、每个 4 行。
+        n=$((n + 1))
+        [ "$n" -gt 2 ] && break
+        tail -4 "$f" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            printf '::error title=node-log::%s\n' \
+                "$(printf '%s' "$line" | tr '\n' ' ' | cut -c1-900)"
+        done
+    done
 }
 
 # RESULT 行应有 10 列：qps ok failed found n p50 p90 p99 p999 max。
@@ -161,7 +216,7 @@ run_config() {
     # 那样测出来的就是「重新握手」而不是「TLS 的稳态开销」。
     if [ "$transport" = "tls" ]; then
         if ! make_cert; then
-            echo "BENCH_FAILED [$label] 证书生成失败"
+            bench_failed "[$label] 证书生成失败"
             return 1
         fi
     else
@@ -170,8 +225,9 @@ run_config() {
     fi
 
     cleanup
-    if ! start_cluster "$nodes"; then
-        echo "BENCH_FAILED [$label] 集群未启动"
+    if ! start_cluster "$nodes" "$transport"; then
+        bench_failed "[$label] 集群未启动"
+        report_node_log
         return 1
     fi
 
@@ -183,7 +239,7 @@ run_config() {
             ${BENCH_TLS_ARGS[@]+"${BENCH_TLS_ARGS[@]}"} >"$TMP/bench-$label-$rep.log" 2>&1
         local rc=$?
         if [ $rc -ne 0 ]; then
-            echo "BENCH_FAILED [$label] bench 退出码 $rc，日志尾部：" >&2
+            bench_failed "[$label] bench 退出码 $rc"
             tail -5 "$TMP/bench-$label-$rep.log" >&2
             return 1
         fi
@@ -199,14 +255,14 @@ run_config() {
         local rows bad
         rows=$(wc -l <"$out")
         if [ "$rows" -ne "$REPS" ]; then
-            echo "BENCH_FAILED [$label] 只收到 ${rows} 行 RESULT，应为 ${REPS} 行" >&2
+            bench_failed "[$label] 只收到 ${rows} 行 RESULT，应为 ${REPS} 行"
             echo "  bench 输出尾部：" >&2
             tail -8 "$TMP/bench-$label-$rep.log" >&2
             return 1
         fi
         bad=$(awk -F '\t' 'NF != '"$RESULT_COLS"' { print "第 " NR " 行有 " NF " 列"; exit }' "$out")
         if [ -n "$bad" ]; then
-            echo "BENCH_FAILED [$label] RESULT 行格式不对：${bad}（应为 ${RESULT_COLS} 列）" >&2
+            bench_failed "[$label] RESULT 行格式不对：${bad}（应为 ${RESULT_COLS} 列）"
             echo "  bench 输出尾部：" >&2
             tail -8 "$TMP/bench-$label-$rep.log" >&2
             return 1
@@ -225,7 +281,7 @@ run_config() {
     local v
     for v in "$qps" "$p50" "$p99" "$p999"; do
         if [ -z "$v" ] || [ "$v" = "NA" ]; then
-            echo "BENCH_FAILED [$label] 延迟分位数取不到值（列顺序与 bench 的 RESULT 行不匹配？）" >&2
+            bench_failed "[$label] 延迟分位数取不到值（列顺序与 bench 的 RESULT 行不匹配？）"
             return 1
         fi
     done
